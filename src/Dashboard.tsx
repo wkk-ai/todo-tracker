@@ -6,6 +6,7 @@ import { BarChart } from "./ui";
 import type { CalEvent } from "./native";
 import {
   bucketLabel,
+  calendarEventMatches,
   checkInsDue,
   dayNumber,
   fiveWeeks,
@@ -50,6 +51,7 @@ type Props = {
   events: CalEvent[];
   googleConnected: boolean;
   agendaError: string;
+  onRefreshAgenda: () => void;
   onOpenAgenda: (event: CalEvent) => void;
   onOpenSettings: () => void;
   onOpenTask: (task: Task) => void;
@@ -91,6 +93,7 @@ export function Dashboard({
   events,
   googleConnected,
   agendaError,
+  onRefreshAgenda,
   onOpenAgenda,
   onOpenSettings,
   onOpenTask,
@@ -388,7 +391,7 @@ export function Dashboard({
       {heavy && <p className="hint">{heavy}</p>}
 
       <section className="card">
-        <h2>Meetings this week</h2>
+        <div className="row-between"><h2>Meetings this week</h2><button type="button" className="text-button" onClick={onRefreshAgenda}>Refresh</button></div>
         {!googleConnected && <p className="quiet">Connect Google Calendar in Settings. The next seven days show up here, and each one can hold its notes.</p>}
         {googleConnected && agendaError && <p className="form-error">{agendaError}</p>}
         {googleConnected && !agendaError && events.length === 0 && <p className="quiet">Nothing is on the calendar for the next seven days.</p>}
@@ -399,7 +402,7 @@ export function Dashboard({
         )}
         <div className="people-list">
           {events.map((event) => {
-            const linked = data.meetings.some((meeting) => meeting.calendarUid && meeting.calendarUid === event.id);
+            const linked = data.meetings.some((meeting) => calendarEventMatches(meeting, event));
             return (
               <button key={`${event.id}-${event.date}`} className="person-row" onClick={() => onOpenAgenda(event)}>
                 <span className="person-name">

@@ -3,12 +3,14 @@ import test from "node:test";
 import {
   addDays,
   bucketFor,
+  boardCsv,
   DEFAULT_SETTINGS,
   duePresets,
   fridayThisWeek,
   isOnBoard,
   endOfWeek,
   agendaFromIcs,
+  calendarEventMatches,
   fullestDayLine,
   groupOpen,
   lastMetMeeting,
@@ -17,6 +19,7 @@ import {
   nextMeeting,
   nextMonday,
   nextSevenDays,
+  nextDue,
   oldestOpen,
   openByPerson,
   openTasksForPerson,
@@ -271,7 +274,7 @@ test("someday and the catch pile stay off the home list", () => {
   );
 });
 
-test("a calendar week keeps this week's meetings and drops cancelled ones", () => {
+test("a calendar week keeps this week's meetings and drops cancelled ones", async () => {
   const text = [
     "BEGIN:VCALENDAR",
     "BEGIN:VEVENT",
@@ -299,7 +302,7 @@ test("a calendar week keeps this week's meetings and drops cancelled ones", () =
     "END:VEVENT",
     "END:VCALENDAR",
   ].join("\n");
-  const events = agendaFromIcs(text, sunday);
+  const events = await agendaFromIcs(text, sunday);
   assert.equal(events.some((event) => event.title === "Cancelled"), false);
   assert.equal(events.some((event) => event.title === "Far away"), false);
   const gui = events.find((event) => event.title === "Gui sync");
@@ -308,4 +311,29 @@ test("a calendar week keeps this week's meetings and drops cancelled ones", () =
   assert.equal(gui?.id, "one@x");
   assert.equal(gui?.url, "https://meet.example/one");
   assert.equal(events.filter((event) => event.title === "Monday").map((event) => event.date).join(","), "2026-11-02");
+});
+
+test("monthly repeats keep their original day through short months and leap years", () => {
+  assert.equal(nextDue("2027-01-31", "monthly", "2027-01-31", 31), "2027-02-28");
+  assert.equal(nextDue("2027-02-28", "monthly", "2027-02-28", 31), "2027-03-31");
+  assert.equal(nextDue("2024-01-31", "monthly", "2024-01-31", 31), "2024-02-29");
+  assert.equal(nextDue("2024-02-29", "monthly", "2024-02-29", 31), "2024-03-31");
+});
+
+test("CSV exports quote line breaks and neutralize spreadsheet formulas", () => {
+  const data = {
+    people: [person("mic", "Mic")],
+    meetings: [meeting({ id: "m1", personId: "mic", title: "Planning" })],
+    tasks: [task({ id: "formula", title: '=HYPERLINK("https://bad.example","open")', notes: "first\r\nsecond" })],
+  } as Data;
+  const csv = boardCsv(data);
+  assert.match(csv, /"'=HYPERLINK\(""https:\/\/bad\.example"",""open""\)"/);
+  assert.match(csv, /"first\r\nsecond"/);
+});
+
+test("calendar meeting matching supports occurrence ids and legacy series ids", () => {
+  const event = { id: "weekly@x::20261103T150000Z", date: "2026-11-03", time: "15:00", title: "Sync", url: "" };
+  assert.equal(calendarEventMatches(meeting({ id: "linked", personId: "mic", meetingDate: event.date, calendarUid: event.id }), event), true);
+  assert.equal(calendarEventMatches(meeting({ id: "legacy", personId: "mic", meetingDate: event.date, calendarUid: "weekly@x" }), event), true);
+  assert.equal(calendarEventMatches(meeting({ id: "wrong-day", personId: "mic", meetingDate: "2026-11-04", calendarUid: "weekly@x" }), event), false);
 });

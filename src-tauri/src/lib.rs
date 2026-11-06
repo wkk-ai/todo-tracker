@@ -1,12 +1,17 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, WebviewWindow};
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_sql::{Migration, MigrationKind};
+
+mod persistence;
+
+const MAX_CALENDAR_BYTES: u64 = 5 * 1024 * 1024;
 
 fn up(version: i64, description: &'static str, sql: &'static str) -> Migration {
     Migration {
@@ -30,12 +35,19 @@ fn parse_events(raw: &str) -> Vec<CalEvent> {
             continue;
         };
         let mut parts = date.split('-');
-        let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
-        let Ok(year) = year.parse::<i32>() else { continue };
-        let Ok(month) = month.parse::<i32>() else { continue };
-        let Ok(day) = day.parse::<i32>() else { continue };
+        let Ok(year) = year.parse::<i32>() else {
+            continue;
+        };
+        let Ok(month) = month.parse::<i32>() else {
+            continue;
+        };
+        let Ok(day) = day.parse::<i32>() else {
+            continue;
+        };
         if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
             continue;
         }
@@ -44,7 +56,10 @@ fn parse_events(raw: &str) -> Vec<CalEvent> {
         if title.is_empty() {
             continue;
         }
-        if events.iter().any(|event| event.date == date && event.title == title) {
+        if events
+            .iter()
+            .any(|event| event.date == date && event.title == title)
+        {
             continue;
         }
         events.push(CalEvent {
@@ -77,14 +92,66 @@ fn google_calendar_url(url: &str) -> Result<(), String> {
 #[tauri::command]
 fn fetch_google_calendar(url: String) -> Result<String, String> {
     google_calendar_url(&url)?;
-    let output = Command::new("curl")
-        .args(["-fsS", "--max-redirs", "0", "--max-time", "20", "-A", "To-Do Tracker", url.trim()])
-        .output()
-        .map_err(|err| err.to_string())?;
-    if !output.status.success() {
+    let escaped_url = url.trim().replace('\\', "\\\\").replace('"', "\\\"");
+    let mut child = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-redirs",
+            "0",
+            "--max-time",
+            "20",
+            "--max-filesize",
+            &MAX_CALENDAR_BYTES.to_string(),
+            "--user-agent",
+            "To-Do Tracker",
+            "--config",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "Google Calendar could not be fetched.".to_owned())?;
+    if child
+        .stdin
+        .take()
+        .ok_or_else(|| "Google Calendar could not be fetched.".to_owned())?
+        .write_all(format!("url = \"{escaped_url}\"\n").as_bytes())
+        .is_err()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Google Calendar could not be fetched.".into());
+    }
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Google Calendar could not be fetched.".to_owned())?;
+    let mut body = Vec::with_capacity((MAX_CALENDAR_BYTES as usize).min(64 * 1024));
+    if stdout
+        .take(MAX_CALENDAR_BYTES + 1)
+        .read_to_end(&mut body)
+        .is_err()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Google Calendar could not be fetched.".into());
+    }
+    if body.len() as u64 > MAX_CALENDAR_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("The calendar file is too large to read.".into());
+    }
+    if !child
+        .wait()
+        .map_err(|_| "Google Calendar could not be fetched.".to_owned())?
+        .success()
+    {
         return Err("Google Calendar did not answer.".into());
     }
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let text = String::from_utf8_lossy(&body).into_owned();
     if !text.contains("BEGIN:VCALENDAR") {
         return Err("That address did not return a calendar.".into());
     }
@@ -147,32 +214,37 @@ return output
 }
 
 #[tauri::command]
-fn backup_database(app: tauri::AppHandle, name: String) -> Result<String, String> {
-    let safe: String = name
+async fn save_text_file(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    default_name: String,
+    contents: String,
+) -> Result<bool, String> {
+    if !["main", "person"].contains(&window.label()) {
+        return Err("Exports can only be saved from the app window.".into());
+    }
+    let safe_name: String = default_name
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .filter(|character| character.is_ascii_alphanumeric() || "-_.".contains(*character))
+        .take(96)
         .collect();
-    if safe.is_empty() {
-        return Err("Name the backup.".into());
+    if safe_name.is_empty() {
+        return Err("Choose a file name.".into());
     }
-    let dir = app.path().app_config_dir().map_err(|err| err.to_string())?;
-    let backups = dir.join("Backups");
-    std::fs::create_dir_all(&backups).map_err(|err| err.to_string())?;
-    let src = dir.join("todo-tracker.db");
-    if !src.exists() {
-        return Err("Nothing to back up yet.".into());
-    }
-    let dest = backups.join(&safe);
-    std::fs::copy(&src, &dest).map_err(|err| err.to_string())?;
-    Ok(dest.to_string_lossy().into_owned())
-}
-
-#[tauri::command]
-fn write_text_file(path: String, contents: String) -> Result<(), String> {
-    if path.trim().is_empty() {
-        return Err("Choose a place to save.".into());
-    }
-    std::fs::write(path, contents).map_err(|err| err.to_string())
+    let Some(selected) = app
+        .dialog()
+        .file()
+        .set_file_name(safe_name)
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let destination = selected
+        .into_path()
+        .map_err(|_| "The selected save location is not available.".to_owned())?;
+    std::fs::write(destination, contents)
+        .map_err(|_| "Could not save the exported file.".to_owned())?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -209,15 +281,23 @@ struct TrayLine {
 
 #[tauri::command]
 fn set_tray_menu(app: tauri::AppHandle, lines: Vec<TrayLine>) -> Result<(), String> {
-    let open = MenuItem::with_id(&app, "open-app", "Open To-Do Tracker", true, None::<&str>).map_err(|err| err.to_string())?;
-    let log = MenuItem::with_id(&app, "log-meeting", "Log a meeting", true, None::<&str>).map_err(|err| err.to_string())?;
-    let mut owned = vec![open, log];
+    let open = MenuItem::with_id(&app, "open-app", "Open To-Do Tracker", true, None::<&str>)
+        .map_err(|err| err.to_string())?;
+    let log = MenuItem::with_id(&app, "log-meeting", "Log a meeting", true, None::<&str>)
+        .map_err(|err| err.to_string())?;
+    let capture = MenuItem::with_id(&app, "quick-capture", "Quick capture", true, None::<&str>)
+        .map_err(|err| err.to_string())?;
+    let mut owned = vec![open, capture, log];
     for line in lines.into_iter().take(8) {
         let label: String = line.label.chars().take(80).collect();
         let id = format!("task-{}", line.id);
-        owned.push(MenuItem::with_id(&app, &id, label, true, None::<&str>).map_err(|err| err.to_string())?);
+        owned.push(
+            MenuItem::with_id(&app, &id, label, true, None::<&str>)
+                .map_err(|err| err.to_string())?,
+        );
     }
-    let refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = owned.iter().map(|item| item as _).collect();
+    let refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+        owned.iter().map(|item| item as _).collect();
     let menu = Menu::with_items(&app, &refs).map_err(|err| err.to_string())?;
     if let Some(tray) = app.tray_by_id("tray") {
         tray.set_menu(Some(menu)).map_err(|err| err.to_string())?;
@@ -258,10 +338,16 @@ fn setup_tray(app: &tauri::App) {
             let id = event.id().as_ref();
             if id == "log-meeting" {
                 let _ = app.emit("log-meeting", ());
+            } else if id == "quick-capture" {
+                let _ = app.emit("quick-capture", ());
             } else if let Some(task_id) = id.strip_prefix("task-") {
                 let _ = app.emit("show-task", task_id.to_string());
             }
-            if id == "open-app" || id == "log-meeting" || id.starts_with("task-") {
+            if id == "open-app"
+                || id == "log-meeting"
+                || id == "quick-capture"
+                || id.starts_with("task-")
+            {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
@@ -316,23 +402,91 @@ pub fn run() {
                 created_at TEXT NOT NULL
             );",
         ),
-        up(4, "index_meetings_person", "CREATE INDEX idx_meetings_person ON meetings(person_id);"),
-        up(5, "index_tasks_meeting", "CREATE INDEX idx_tasks_meeting ON tasks(meeting_id);"),
-        up(6, "index_tasks_requester", "CREATE INDEX idx_tasks_requester ON tasks(requester_id);"),
-        up(7, "people_color", "ALTER TABLE people ADD COLUMN color TEXT NOT NULL DEFAULT '';"),
-        up(8, "people_company", "ALTER TABLE people ADD COLUMN company_id TEXT;"),
-        up(9, "people_check_in", "ALTER TABLE people ADD COLUMN check_in_on TEXT;"),
-        up(10, "people_cadence", "ALTER TABLE people ADD COLUMN cadence_days INTEGER;"),
-        up(11, "companies", "CREATE TABLE companies (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);"),
-        up(12, "tasks_priority", "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'none';"),
-        up(13, "tasks_pinned", "ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;"),
-        up(14, "tasks_evening", "ALTER TABLE tasks ADD COLUMN evening INTEGER NOT NULL DEFAULT 0;"),
-        up(15, "tasks_repeat", "ALTER TABLE tasks ADD COLUMN repeat_rule TEXT;"),
-        up(16, "tasks_notes", "ALTER TABLE tasks ADD COLUMN notes TEXT NOT NULL DEFAULT '';"),
-        up(17, "tasks_moved", "ALTER TABLE tasks ADD COLUMN moved_count INTEGER NOT NULL DEFAULT 0;"),
-        up(18, "tasks_parent", "ALTER TABLE tasks ADD COLUMN parent_id TEXT;"),
-        up(19, "tasks_remind", "ALTER TABLE tasks ADD COLUMN remind INTEGER NOT NULL DEFAULT 0;"),
-        up(20, "tasks_updated", "ALTER TABLE tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';"),
+        up(
+            4,
+            "index_meetings_person",
+            "CREATE INDEX idx_meetings_person ON meetings(person_id);",
+        ),
+        up(
+            5,
+            "index_tasks_meeting",
+            "CREATE INDEX idx_tasks_meeting ON tasks(meeting_id);",
+        ),
+        up(
+            6,
+            "index_tasks_requester",
+            "CREATE INDEX idx_tasks_requester ON tasks(requester_id);",
+        ),
+        up(
+            7,
+            "people_color",
+            "ALTER TABLE people ADD COLUMN color TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            8,
+            "people_company",
+            "ALTER TABLE people ADD COLUMN company_id TEXT;",
+        ),
+        up(
+            9,
+            "people_check_in",
+            "ALTER TABLE people ADD COLUMN check_in_on TEXT;",
+        ),
+        up(
+            10,
+            "people_cadence",
+            "ALTER TABLE people ADD COLUMN cadence_days INTEGER;",
+        ),
+        up(
+            11,
+            "companies",
+            "CREATE TABLE companies (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);",
+        ),
+        up(
+            12,
+            "tasks_priority",
+            "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'none';",
+        ),
+        up(
+            13,
+            "tasks_pinned",
+            "ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            14,
+            "tasks_evening",
+            "ALTER TABLE tasks ADD COLUMN evening INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            15,
+            "tasks_repeat",
+            "ALTER TABLE tasks ADD COLUMN repeat_rule TEXT;",
+        ),
+        up(
+            16,
+            "tasks_notes",
+            "ALTER TABLE tasks ADD COLUMN notes TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            17,
+            "tasks_moved",
+            "ALTER TABLE tasks ADD COLUMN moved_count INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            18,
+            "tasks_parent",
+            "ALTER TABLE tasks ADD COLUMN parent_id TEXT;",
+        ),
+        up(
+            19,
+            "tasks_remind",
+            "ALTER TABLE tasks ADD COLUMN remind INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            20,
+            "tasks_updated",
+            "ALTER TABLE tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';",
+        ),
         up(
             21,
             "meeting_people",
@@ -363,7 +517,11 @@ pub fn run() {
                 position INTEGER NOT NULL DEFAULT 0
             );",
         ),
-        up(24, "tags", "CREATE TABLE tags (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);"),
+        up(
+            24,
+            "tags",
+            "CREATE TABLE tags (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);",
+        ),
         up(
             25,
             "task_tags",
@@ -416,7 +574,11 @@ pub fn run() {
                 person_id TEXT
             );",
         ),
-        up(30, "settings", "CREATE TABLE settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);"),
+        up(
+            30,
+            "settings",
+            "CREATE TABLE settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+        ),
         up(
             31,
             "removed_people",
@@ -427,42 +589,186 @@ pub fn run() {
                 removed_at TEXT NOT NULL
             );",
         ),
-        up(32, "people_paused", "ALTER TABLE people ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;"),
-        up(33, "people_household", "ALTER TABLE people ADD COLUMN household TEXT NOT NULL DEFAULT '';"),
-        up(34, "people_met", "ALTER TABLE people ADD COLUMN met_how TEXT NOT NULL DEFAULT '';"),
-        up(35, "people_starred", "ALTER TABLE people ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;"),
-        up(36, "people_zone", "ALTER TABLE people ADD COLUMN timezone TEXT NOT NULL DEFAULT '';"),
-        up(37, "people_place", "ALTER TABLE people ADD COLUMN place TEXT NOT NULL DEFAULT '';"),
-        up(38, "people_event", "ALTER TABLE people ADD COLUMN event_group TEXT NOT NULL DEFAULT '';"),
-        up(39, "people_promise", "ALTER TABLE people ADD COLUMN promise_on TEXT;"),
-        up(40, "people_sequential", "ALTER TABLE people ADD COLUMN sequential INTEGER NOT NULL DEFAULT 0;"),
-        up(41, "tasks_do_on", "ALTER TABLE tasks ADD COLUMN do_on TEXT;"),
-        up(42, "tasks_hide", "ALTER TABLE tasks ADD COLUMN hide_until TEXT;"),
-        up(43, "tasks_someday", "ALTER TABLE tasks ADD COLUMN someday INTEGER NOT NULL DEFAULT 0;"),
-        up(44, "tasks_section", "ALTER TABLE tasks ADD COLUMN section_id TEXT;"),
-        up(45, "tasks_owner", "ALTER TABLE tasks ADD COLUMN owner TEXT NOT NULL DEFAULT 'mine';"),
-        up(46, "tasks_clock", "ALTER TABLE tasks ADD COLUMN clock_time TEXT NOT NULL DEFAULT '';"),
-        up(47, "tasks_duration", "ALTER TABLE tasks ADD COLUMN duration_min INTEGER NOT NULL DEFAULT 0;"),
-        up(48, "tasks_remind_time", "ALTER TABLE tasks ADD COLUMN remind_time TEXT NOT NULL DEFAULT '';"),
-        up(49, "tasks_count_done", "ALTER TABLE tasks ADD COLUMN count_done INTEGER NOT NULL DEFAULT 0;"),
-        up(50, "tasks_count_goal", "ALTER TABLE tasks ADD COLUMN count_goal INTEGER NOT NULL DEFAULT 0;"),
-        up(51, "tasks_blocked", "ALTER TABLE tasks ADD COLUMN blocked_by TEXT;"),
-        up(52, "tasks_span", "ALTER TABLE tasks ADD COLUMN span_end TEXT;"),
-        up(53, "tasks_source", "ALTER TABLE tasks ADD COLUMN source_url TEXT NOT NULL DEFAULT '';"),
-        up(54, "tasks_indent", "ALTER TABLE tasks ADD COLUMN indent INTEGER NOT NULL DEFAULT 0;"),
-        up(55, "tasks_wake", "ALTER TABLE tasks ADD COLUMN wake TEXT NOT NULL DEFAULT '';"),
-        up(56, "tasks_folded", "ALTER TABLE tasks ADD COLUMN folded INTEGER NOT NULL DEFAULT 0;"),
-        up(57, "tasks_line", "ALTER TABLE tasks ADD COLUMN source_line TEXT NOT NULL DEFAULT '';"),
-        up(58, "tasks_unfiled", "ALTER TABLE tasks ADD COLUMN unfiled INTEGER NOT NULL DEFAULT 0;"),
-        up(59, "tasks_returned", "ALTER TABLE tasks ADD COLUMN returned INTEGER NOT NULL DEFAULT 0;"),
-        up(60, "tasks_spent", "ALTER TABLE tasks ADD COLUMN spent_min INTEGER NOT NULL DEFAULT 0;"),
-        up(61, "meetings_private", "ALTER TABLE meetings ADD COLUMN private_note TEXT NOT NULL DEFAULT '';"),
-        up(62, "meetings_next", "ALTER TABLE meetings ADD COLUMN next_on TEXT;"),
-        up(63, "meetings_focus", "ALTER TABLE meetings ADD COLUMN next_focus TEXT NOT NULL DEFAULT '';"),
-        up(64, "meetings_span", "ALTER TABLE meetings ADD COLUMN span_end TEXT;"),
-        up(65, "meetings_source", "ALTER TABLE meetings ADD COLUMN source_url TEXT NOT NULL DEFAULT '';"),
-        up(66, "meetings_pinned", "ALTER TABLE meetings ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;"),
-        up(67, "decisions_why", "ALTER TABLE decisions ADD COLUMN why TEXT NOT NULL DEFAULT '';"),
+        up(
+            32,
+            "people_paused",
+            "ALTER TABLE people ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            33,
+            "people_household",
+            "ALTER TABLE people ADD COLUMN household TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            34,
+            "people_met",
+            "ALTER TABLE people ADD COLUMN met_how TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            35,
+            "people_starred",
+            "ALTER TABLE people ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            36,
+            "people_zone",
+            "ALTER TABLE people ADD COLUMN timezone TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            37,
+            "people_place",
+            "ALTER TABLE people ADD COLUMN place TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            38,
+            "people_event",
+            "ALTER TABLE people ADD COLUMN event_group TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            39,
+            "people_promise",
+            "ALTER TABLE people ADD COLUMN promise_on TEXT;",
+        ),
+        up(
+            40,
+            "people_sequential",
+            "ALTER TABLE people ADD COLUMN sequential INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            41,
+            "tasks_do_on",
+            "ALTER TABLE tasks ADD COLUMN do_on TEXT;",
+        ),
+        up(
+            42,
+            "tasks_hide",
+            "ALTER TABLE tasks ADD COLUMN hide_until TEXT;",
+        ),
+        up(
+            43,
+            "tasks_someday",
+            "ALTER TABLE tasks ADD COLUMN someday INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            44,
+            "tasks_section",
+            "ALTER TABLE tasks ADD COLUMN section_id TEXT;",
+        ),
+        up(
+            45,
+            "tasks_owner",
+            "ALTER TABLE tasks ADD COLUMN owner TEXT NOT NULL DEFAULT 'mine';",
+        ),
+        up(
+            46,
+            "tasks_clock",
+            "ALTER TABLE tasks ADD COLUMN clock_time TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            47,
+            "tasks_duration",
+            "ALTER TABLE tasks ADD COLUMN duration_min INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            48,
+            "tasks_remind_time",
+            "ALTER TABLE tasks ADD COLUMN remind_time TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            49,
+            "tasks_count_done",
+            "ALTER TABLE tasks ADD COLUMN count_done INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            50,
+            "tasks_count_goal",
+            "ALTER TABLE tasks ADD COLUMN count_goal INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            51,
+            "tasks_blocked",
+            "ALTER TABLE tasks ADD COLUMN blocked_by TEXT;",
+        ),
+        up(
+            52,
+            "tasks_span",
+            "ALTER TABLE tasks ADD COLUMN span_end TEXT;",
+        ),
+        up(
+            53,
+            "tasks_source",
+            "ALTER TABLE tasks ADD COLUMN source_url TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            54,
+            "tasks_indent",
+            "ALTER TABLE tasks ADD COLUMN indent INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            55,
+            "tasks_wake",
+            "ALTER TABLE tasks ADD COLUMN wake TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            56,
+            "tasks_folded",
+            "ALTER TABLE tasks ADD COLUMN folded INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            57,
+            "tasks_line",
+            "ALTER TABLE tasks ADD COLUMN source_line TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            58,
+            "tasks_unfiled",
+            "ALTER TABLE tasks ADD COLUMN unfiled INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            59,
+            "tasks_returned",
+            "ALTER TABLE tasks ADD COLUMN returned INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            60,
+            "tasks_spent",
+            "ALTER TABLE tasks ADD COLUMN spent_min INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            61,
+            "meetings_private",
+            "ALTER TABLE meetings ADD COLUMN private_note TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            62,
+            "meetings_next",
+            "ALTER TABLE meetings ADD COLUMN next_on TEXT;",
+        ),
+        up(
+            63,
+            "meetings_focus",
+            "ALTER TABLE meetings ADD COLUMN next_focus TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            64,
+            "meetings_span",
+            "ALTER TABLE meetings ADD COLUMN span_end TEXT;",
+        ),
+        up(
+            65,
+            "meetings_source",
+            "ALTER TABLE meetings ADD COLUMN source_url TEXT NOT NULL DEFAULT '';",
+        ),
+        up(
+            66,
+            "meetings_pinned",
+            "ALTER TABLE meetings ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+        ),
+        up(
+            67,
+            "decisions_why",
+            "ALTER TABLE decisions ADD COLUMN why TEXT NOT NULL DEFAULT '';",
+        ),
         up(
             68,
             "bullets",
@@ -534,6 +840,43 @@ pub fn run() {
             "meetings_calendar_uid",
             "ALTER TABLE meetings ADD COLUMN calendar_uid TEXT NOT NULL DEFAULT '';",
         ),
+        up(
+            75,
+            "tasks_repeat_anchor_day",
+            "ALTER TABLE tasks ADD COLUMN repeat_anchor_day INTEGER;",
+        ),
+        up(
+            76,
+            "capture_entries",
+            "CREATE TABLE capture_entries (
+                id TEXT PRIMARY KEY NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                offset_min INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'note',
+                actor_id TEXT NOT NULL DEFAULT '',
+                meeting_id TEXT NOT NULL DEFAULT '',
+                task_id TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX capture_entries_created_at ON capture_entries(created_at);
+            CREATE INDEX capture_entries_meeting_id ON capture_entries(meeting_id);",
+        ),
+        up(
+            77,
+            "meeting_save_receipts",
+            "CREATE TABLE meeting_save_receipts (
+                save_id TEXT PRIMARY KEY NOT NULL,
+                meeting_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                task_count INTEGER NOT NULL DEFAULT 0
+            );",
+        ),
+        up(
+            78,
+            "meeting_save_receipt_payload_hash",
+            "ALTER TABLE meeting_save_receipts ADD COLUMN payload_hash TEXT;",
+        ),
     ];
 
     tauri::Builder::default()
@@ -546,6 +889,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .manage(persistence::TransactionRegistry::default())
         .invoke_handler(tauri::generate_handler![
             set_menu_count,
             set_tray_menu,
@@ -553,11 +897,34 @@ pub fn run() {
             say_text,
             calendar_week,
             fetch_google_calendar,
-            backup_database,
-            write_text_file,
+            persistence::backup_database,
+            persistence::begin_database_transaction,
+            persistence::transaction_execute,
+            persistence::transaction_select,
+            persistence::finish_database_transaction,
+            persistence::database_transaction_status,
+            save_text_file,
             copy_attachment
         ])
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                let registry = window
+                    .app_handle()
+                    .state::<persistence::TransactionRegistry>()
+                    .inner()
+                    .clone();
+                let owner = window.label().to_owned();
+                tauri::async_runtime::spawn(async move {
+                    persistence::rollback_transactions_for_window(registry, owner).await;
+                });
+            }
+        })
         .setup(|app| {
+            persistence::start_transaction_cleanup(
+                app.state::<persistence::TransactionRegistry>()
+                    .inner()
+                    .clone(),
+            );
             setup_tray(app);
             let _ = app.global_shortcut().on_shortcut(
                 "CommandOrControl+Shift+Y",
@@ -571,7 +938,7 @@ pub fn run() {
                 "CommandOrControl+Shift+N",
                 |app, _shortcut, event| {
                     if event.state == ShortcutState::Pressed {
-                        let _ = app.emit("log-meeting", ());
+                        let _ = app.emit("quick-capture", ());
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.unminimize();
                             let _ = window.show();

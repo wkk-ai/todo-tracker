@@ -1,3 +1,5 @@
+import type { CaptureEntry, MeetingSaveReceipt } from "./capture.ts";
+
 export type TaskStatus = "open" | "in_progress" | "waiting" | "done" | "set_aside" | "void";
 export type Owner = "mine" | "theirs";
 export type Priority = "none" | "low" | "medium" | "high";
@@ -56,6 +58,7 @@ export type Task = {
   pinned: boolean;
   evening: boolean;
   repeatRule: RepeatRule;
+  repeatAnchorDay?: number | null;
   notes: string;
   movedCount: number;
   parentId: string | null;
@@ -176,6 +179,8 @@ export type Data = {
   gifts: Gift[];
   asks: AskLater[];
   logs: DayLog[];
+  captureEntries?: CaptureEntry[];
+  meetingSaveReceipts?: MeetingSaveReceipt[];
 };
 
 export type Bucket = "overdue" | "today" | "evening" | "this_week" | "later" | "none";
@@ -623,12 +628,16 @@ export function readDateInTitle(title: string, today: string): DateReading | nul
   return null;
 }
 
-export function nextDue(dueOn: string | null, rule: RepeatRule, today: string): string {
+export function nextDue(dueOn: string | null, rule: RepeatRule, today: string, anchorDay?: number | null): string {
   const base = dueOn && dueOn > today ? dueOn : today;
   if (rule === "weekly") return addDays(base, 7);
   if (rule === "monthly") {
     const date = parseISODate(base);
+    const originalDay = anchorDay ?? parseISODate(dueOn ?? today).getDate();
+    date.setDate(1);
     date.setMonth(date.getMonth() + 1);
+    const daysInMonth = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+    date.setDate(Math.min(originalDay, daysInMonth));
     return formatISODate(date);
   }
   return addDays(base, 1);
@@ -763,8 +772,9 @@ export function bucketLabel(bucket: Bucket): string {
 }
 
 function csvCell(value: string): string {
-  if (/[",\n]/.test(value)) return `"${value.replace(/"/g, '""')}"`;
-  return value;
+  const safe = /^[\u0000-\u0020]*[=+\-@]/.test(value) ? `'${value}` : value;
+  if (/[",\r\n]/.test(safe)) return `"${safe.replace(/"/g, '""')}"`;
+  return safe;
 }
 
 export function boardText(data: Data, today: string): string {
@@ -831,90 +841,28 @@ export function meetingText(data: Data, meetingId: string, today: string): strin
   return lines.join("\n").trim() + "\n";
 }
 
-export type AgendaEvent = { id: string; date: string; time: string; title: string; url: string };
+export type AgendaEvent = {
+  id: string;
+  date: string;
+  time: string;
+  title: string;
+  url: string;
+  start?: string;
+  end?: string;
+  allDay?: boolean;
+};
 
-const AGENDA_DAYS = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
-
-function unfoldCalendar(text: string): string {
-  return text.replace(/\r\n/g, "\n").replace(/\n[ \t]/g, "");
+export async function agendaFromIcs(text: string, today: string, displayTimeZone?: string): Promise<AgendaEvent[]> {
+  const { parseAgendaFromIcs } = await import("./calendar.ts");
+  return parseAgendaFromIcs(text, today, displayTimeZone);
 }
 
-function calendarText(value: string): string {
-  return value.replace(/\\n/gi, " ").replace(/\\,/g, ",").replace(/\\;/g, ";").trim();
-}
-
-function whenOf(line: string): { date: string; time: string } | null {
-  const value = line.split(":").pop() ?? "";
-  const match = value.match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2}))?/);
-  if (!match) return null;
-  const date = `${match[1]}-${match[2]}-${match[3]}`;
-  const time = match[4] ? `${match[4]}:${match[5]}` : "";
-  if (value.endsWith("Z") && match[4]) {
-    const instant = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5])));
-    const localDate = `${instant.getFullYear()}-${String(instant.getMonth() + 1).padStart(2, "0")}-${String(instant.getDate()).padStart(2, "0")}`;
-    const localTime = `${String(instant.getHours()).padStart(2, "0")}:${String(instant.getMinutes()).padStart(2, "0")}`;
-    return { date: localDate, time: localTime };
-  }
-  return { date, time };
-}
-
-function datesForRule(start: string, rule: string, today: string, end: string): string[] {
-  const parts = Object.fromEntries(rule.split(";").map((part) => {
-    const [key, value] = part.split("=");
-    return [key, value ?? ""];
-  }));
-  const interval = Math.max(1, Number(parts.INTERVAL || 1));
-  const byday = parts.BYDAY ? parts.BYDAY.split(",") : [];
-  const dates: string[] = [];
-  let cursor = today;
-  while (cursor <= end && dates.length < 14) {
-    const gap = daysBetween(start, cursor);
-    if (gap >= 0) {
-      if (parts.FREQ === "DAILY" && gap % interval === 0) dates.push(cursor);
-      if (parts.FREQ === "WEEKLY") {
-        const code = AGENDA_DAYS[parseISODate(cursor).getDay()];
-        const week = Math.floor(gap / 7);
-        const dayOk = byday.length === 0 ? gap % (7 * interval) === 0 : byday.includes(code) && week % interval === 0;
-        if (dayOk) dates.push(cursor);
-      }
-    }
-    cursor = addDays(cursor, 1);
-  }
-  if (parts.FREQ !== "DAILY" && parts.FREQ !== "WEEKLY" && start >= today && start <= end) dates.push(start);
-  return dates;
-}
-
-export function agendaFromIcs(text: string, today: string): AgendaEvent[] {
-  const end = addDays(today, 6);
-  const events: AgendaEvent[] = [];
-  for (const block of unfoldCalendar(text).split("BEGIN:VEVENT").slice(1)) {
-    const body = block.split("END:VEVENT")[0] ?? "";
-    const lines = body.split("\n").map((line) => line.trim()).filter(Boolean);
-    if (lines.some((line) => line.startsWith("STATUS:CANCELLED"))) continue;
-    const startLine = lines.find((line) => line.startsWith("DTSTART"));
-    if (!startLine) continue;
-    const when = whenOf(startLine);
-    if (!when) continue;
-    const summary = lines.find((line) => line.startsWith("SUMMARY"));
-    const title = calendarText(summary?.split(":").slice(1).join(":") ?? "") || "Meeting";
-    const uid = calendarText(lines.find((line) => line.startsWith("UID"))?.split(":").slice(1).join(":") ?? "");
-    const url = calendarText(lines.find((line) => line.startsWith("URL:"))?.slice(4) ?? "");
-    const rule = lines.find((line) => line.startsWith("RRULE:"))?.slice(6) ?? "";
-    const dates = rule ? datesForRule(when.date, rule, today, end) : [when.date];
-    for (const date of dates) {
-      if (date < today || date > end) continue;
-      events.push({ id: uid || `${date}:${title}`, date, time: when.time, title, url });
-    }
-  }
-  const seen = new Set<string>();
-  return events
-    .filter((event) => {
-      const key = `${event.id}|${event.date}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time) || a.title.localeCompare(b.title));
+export function calendarEventMatches(meeting: Meeting, event: AgendaEvent): boolean {
+  if (!meeting.calendarUid) return false;
+  if (meeting.calendarUid === event.id) return true;
+  const separator = event.id.lastIndexOf("::");
+  if (separator < 0 || meeting.calendarUid !== event.id.slice(0, separator)) return false;
+  return meeting.meetingDate === event.date;
 }
 
 export function personInTitle(people: Person[], title: string): Person | null {
@@ -928,8 +876,8 @@ export function personInTitle(people: Person[], title: string): Person | null {
 
 export function shortcutList(): { keys: string; does: string }[] {
   return [
-    { keys: "⌘N", does: "Log a meeting" },
-    { keys: "⌘⇧N", does: "Log a meeting from anywhere on this Mac" },
+    { keys: "⌘N", does: "Quick capture a note or task" },
+    { keys: "⌘⇧N", does: "Quick capture from anywhere on this Mac" },
     { keys: "⌘⇧Y", does: "Hear what is due" },
     { keys: "⌘⇧V", does: "Save a copied line for the last person" },
     { keys: "⌘K", does: "Command menu" },

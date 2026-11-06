@@ -1,4 +1,6 @@
-import Database from "@tauri-apps/plugin-sql";
+import SqlDatabase from "@tauri-apps/plugin-sql";
+import type { Database } from "./database.ts";
+import type { CaptureEntry, CaptureKind, MeetingSaveReceipt } from "./capture.ts";
 import {
   addDays,
   findPersonByName,
@@ -29,15 +31,44 @@ import {
   type TaskStatus,
   type Template,
   DEFAULT_SETTINGS,
-} from "./logic";
+} from "./logic.ts";
+
+type DataWithCaptures = Data;
+
+type MeetingSaveRecoveryKind = "payload-mismatch" | "unverifiable-receipt";
+
+export class MeetingSaveRecoveryError extends Error {
+  readonly recoveryKind: MeetingSaveRecoveryKind;
+
+  constructor(recoveryKind: MeetingSaveRecoveryKind, message: string) {
+    super(message);
+    this.name = "MeetingSaveRecoveryError";
+    this.recoveryKind = recoveryKind;
+  }
+}
 
 const DATABASE = "sqlite:todo-tracker.db";
 
-let opening: Promise<Database> | null = null;
+type PromiseSlot<T> = { current: Promise<T> | null };
+
+export function createRetryablePromiseCache<T>(): (load: () => Promise<T>) => Promise<T> {
+  const slot: PromiseSlot<T> = { current: null };
+  return (load) => {
+    if (!slot.current) {
+      const pending = load().catch((error: unknown) => {
+        if (slot.current === pending) slot.current = null;
+        throw error;
+      });
+      slot.current = pending;
+    }
+    return slot.current;
+  };
+}
+
+const cachedDatabaseLoad = createRetryablePromiseCache<Database>();
 
 export function openDatabase(): Promise<Database> {
-  if (!opening) opening = Database.load(DATABASE);
-  return opening;
+  return cachedDatabaseLoad(() => SqlDatabase.load(DATABASE));
 }
 
 function uid(): string {
@@ -60,6 +91,17 @@ function priorityOf(value: string | null | undefined): Priority {
 function repeatOf(value: string | null | undefined): RepeatRule {
   if (value === "daily" || value === "weekly" || value === "monthly") return value;
   return null;
+}
+
+function captureKindOf(value: string | null | undefined): CaptureKind {
+  return value === "mine" || value === "theirs" ? value : "note";
+}
+
+function repeatAnchor(rule: RepeatRule, dueOn: string | null | undefined, anchorDay?: number | null): number | null {
+  if (anchorDay != null && Number.isInteger(anchorDay) && anchorDay >= 1 && anchorDay <= 31) return anchorDay;
+  if (rule !== "monthly" || !dueOn) return null;
+  const day = Number(dueOn.slice(8, 10));
+  return Number.isInteger(day) && day >= 1 && day <= 31 ? day : null;
 }
 
 function statusOf(value: string): TaskStatus {
@@ -129,6 +171,7 @@ type TaskRow = {
   parent_id: string | null;
   remind: number;
   updated_at: string;
+  repeat_anchor_day?: number | null;
   do_on: string | null;
   hide_until: string | null;
   someday: number;
@@ -188,6 +231,7 @@ function mapTask(row: TaskRow, tagIds: string[]): Task {
     pinned: bit(row.pinned),
     evening: bit(row.evening),
     repeatRule: repeatOf(row.repeat_rule),
+    repeatAnchorDay: row.repeat_anchor_day == null ? null : Number(row.repeat_anchor_day),
     notes: row.notes ?? "",
     movedCount: Number(row.moved_count ?? 0),
     parentId: row.parent_id,
@@ -242,7 +286,7 @@ function readSettings(rows: { key: string; value: string }[]): Settings {
 
 const byId = <T extends { id: string }>(rows: T[]) => rows.sort((a, b) => a.id.localeCompare(b.id));
 
-export async function loadAll(db: Database): Promise<Data> {
+export async function loadAll(db: Database): Promise<DataWithCaptures> {
   const [
     people,
     companies,
@@ -259,6 +303,8 @@ export async function loadAll(db: Database): Promise<Data> {
     views,
     removed,
     settings,
+    captureEntries,
+    meetingSaveReceipts,
   ] = await Promise.all([
     db.select<PersonRow[]>(
       "SELECT id, name, note, created_at, color, company_id, check_in_on, cadence_days, paused, household, met_how, starred, timezone, place, event_group, promise_on, sequential FROM people",
@@ -269,7 +315,7 @@ export async function loadAll(db: Database): Promise<Data> {
     ),
     db.select<{ meeting_id: string; person_id: string }[]>("SELECT meeting_id, person_id FROM meeting_people"),
     db.select<TaskRow[]>(
-      "SELECT id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, notes, moved_count, parent_id, remind, updated_at, do_on, hide_until, someday, section_id, owner, clock_time, duration_min, remind_time, count_done, count_goal, blocked_by, span_end, source_url, indent, wake, folded, source_line, unfiled, returned, spent_min FROM tasks",
+      "SELECT id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, repeat_anchor_day, notes, moved_count, parent_id, remind, updated_at, do_on, hide_until, someday, section_id, owner, clock_time, duration_min, remind_time, count_done, count_goal, blocked_by, span_end, source_url, indent, wake, folded, source_line, unfiled, returned, spent_min FROM tasks",
     ),
     db.select<{ id: string; task_id: string; title: string; done: number; position: number }[]>(
       "SELECT id, task_id, title, done, position FROM checks",
@@ -293,6 +339,12 @@ export async function loadAll(db: Database): Promise<Data> {
       "SELECT id, name, snapshot, removed_at FROM removed_people",
     ),
     db.select<{ key: string; value: string }[]>("SELECT key, value FROM settings"),
+    db.select<{ id: string; body: string; created_at: string; timezone: string; offset_min: number; kind: string; actor_id: string; meeting_id: string; task_id: string }[]>(
+      "SELECT id, body, created_at, timezone, offset_min, kind, actor_id, meeting_id, task_id FROM capture_entries ORDER BY created_at, id",
+    ),
+    db.select<{ save_id: string; meeting_id: string; person_id: string; task_count: number; payload_hash: string | null }[]>(
+      "SELECT save_id, meeting_id, person_id, task_count, payload_hash FROM meeting_save_receipts ORDER BY save_id",
+    ),
   ]);
 
   const tagsByTask = new Map<string, string[]>();
@@ -449,6 +501,24 @@ export async function loadAll(db: Database): Promise<Data> {
     gifts: byId(mappedGifts),
     asks: byId(mappedAsks),
     logs: byId(mappedLogs),
+    captureEntries: captureEntries.map((row): CaptureEntry => ({
+      id: row.id,
+      body: row.body,
+      createdAt: row.created_at,
+      timezone: row.timezone,
+      offsetMin: Number(row.offset_min),
+      kind: captureKindOf(row.kind),
+      actorId: row.actor_id ?? "",
+      meetingId: row.meeting_id ?? "",
+      taskId: row.task_id ?? "",
+    })),
+    meetingSaveReceipts: meetingSaveReceipts.map((row): MeetingSaveReceipt => ({
+      saveId: row.save_id,
+      meetingId: row.meeting_id,
+      personId: row.person_id,
+      taskCount: Number(row.task_count ?? 0),
+      ...(row.payload_hash ? { payloadHash: row.payload_hash } : {}),
+    })),
   };
 }
 
@@ -475,6 +545,7 @@ export type NewTaskInput = {
   dueOn: string | null;
   evening: boolean;
   repeatRule: RepeatRule;
+  repeatAnchorDay?: number | null;
   indent?: number;
   owner?: Owner;
   doOn?: string | null;
@@ -484,6 +555,7 @@ export type NewTaskInput = {
 };
 
 export type SaveMeetingInput = {
+  saveId?: string;
   personId: string | null;
   newPersonName: string | null;
   title: string;
@@ -512,8 +584,75 @@ export type SaveMeetingResult = {
   taskCount: number;
 };
 
+export type UniqueMeetingTaskInput = {
+  task: NewTaskInput;
+  title: string;
+  requesterId: string;
+};
+
+function stableSerialize(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const entries = Object.keys(record)
+      .filter((key) => record[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableSerialize(record[key])}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+async function meetingPayloadHash(input: SaveMeetingInput): Promise<string> {
+  const { saveId: _saveId, ...payload } = input;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stableSerialize(payload)));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function taskIdentity(requesterId: string, title: string): string {
+  return `${requesterId}\u0000${title.trim().toLocaleLowerCase()}`;
+}
+
+export function uniqueMeetingTaskInputs(tasks: NewTaskInput[], personId: string): UniqueMeetingTaskInput[] {
+  const seen = new Set<string>();
+  const unique: UniqueMeetingTaskInput[] = [];
+  for (const task of tasks) {
+    const title = task.title.trim();
+    if (!title) continue;
+    const requesterId = task.requesterId && task.requesterId !== personId ? task.requesterId : personId;
+    const key = taskIdentity(requesterId, title);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push({ task, title, requesterId });
+  }
+  return unique;
+}
+
 export async function saveMeeting(db: Database, input: SaveMeetingInput): Promise<SaveMeetingResult> {
   const existing = await loadAll(db);
+  const saveId = input.saveId?.trim() ?? "";
+  const payloadHash = saveId ? await meetingPayloadHash(input) : "";
+  const savedReceipt = saveId ? existing.meetingSaveReceipts?.find((receipt) => receipt.saveId === saveId) : undefined;
+  if (savedReceipt) {
+    if (!savedReceipt.payloadHash) {
+      throw new MeetingSaveRecoveryError(
+        "unverifiable-receipt",
+        "This save predates content checks, so the original draft cannot be verified. Your draft is safe. Check the meeting for an earlier save, then prepare a new save attempt if you still need to save these changes.",
+      );
+    }
+    if (savedReceipt.payloadHash !== payloadHash) {
+      throw new MeetingSaveRecoveryError(
+        "payload-mismatch",
+        "This save ID was already used for different meeting content. Your edits are still in this draft. Prepare a new save attempt, then retry.",
+      );
+    }
+    return {
+      meetingId: savedReceipt.meetingId,
+      personId: savedReceipt.personId,
+      createdPerson: false,
+      taskCount: savedReceipt.taskCount,
+    };
+  }
   let personId = input.personId;
   let createdPerson = false;
   if (!personId && input.newPersonName) {
@@ -532,8 +671,13 @@ export async function saveMeeting(db: Database, input: SaveMeetingInput): Promis
   }
   if (!personId) throw new Error("Choose a person for this meeting.");
 
-  const prior = (input.calendarUid ?? "").trim()
-    ? existing.meetings.find((item) => item.calendarUid === input.calendarUid)
+  const calendarId = (input.calendarUid ?? "").trim();
+  const seriesId = calendarId.includes("::") ? calendarId.slice(0, calendarId.indexOf("::")) : "";
+  const prior = calendarId
+    ? existing.meetings.find((item) => item.calendarUid === calendarId) ??
+      (seriesId
+        ? existing.meetings.find((item) => item.calendarUid === seriesId && item.meetingDate === input.meetingDate)
+        : undefined)
     : undefined;
   const meetingId = prior?.id ?? uid();
   if (!prior) {
@@ -542,8 +686,9 @@ export async function saveMeeting(db: Database, input: SaveMeetingInput): Promis
       [meetingId, personId, input.title.trim(), input.meetingDate, input.note.trim(), now()],
     );
   }
-  for (const guestId of input.guestIds) {
-    if (guestId && guestId !== personId) {
+  const knownGuestIds = new Set(prior?.guestIds ?? []);
+  for (const guestId of new Set(input.guestIds)) {
+    if (guestId && guestId !== personId && !knownGuestIds.has(guestId)) {
       await db.execute("INSERT INTO meeting_people (meeting_id, person_id) VALUES ($1, $2)", [meetingId, guestId]);
     }
   }
@@ -560,17 +705,14 @@ export async function saveMeeting(db: Database, input: SaveMeetingInput): Promis
   }
 
   let taskCount = 0;
-  for (const task of input.tasks) {
-    const title = task.title.trim();
-    if (!title) continue;
-    const requesterId = task.requesterId && task.requesterId !== personId ? task.requesterId : personId;
-    const same = existing.tasks.find(
-      (item) =>
-        item.requesterId === requesterId &&
-        item.title.trim().toLowerCase() === title.toLowerCase() &&
-        item.status !== "done" &&
-        item.status !== "void",
-    );
+  const activeTasks = new Map<string, Task>();
+  for (const item of existing.tasks) {
+    if (item.status === "done" || item.status === "void") continue;
+    const key = taskIdentity(item.requesterId, item.title);
+    if (!activeTasks.has(key)) activeTasks.set(key, item);
+  }
+  for (const { task, title, requesterId } of uniqueMeetingTaskInputs(input.tasks, personId)) {
+    const same = activeTasks.get(taskIdentity(requesterId, title));
     if (same) {
       await db.execute("UPDATE tasks SET notes = $1, source_line = $2, updated_at = $3 WHERE id = $4", [
         same.notes ? `${same.notes}\nAsked again ${input.meetingDate}` : `Asked again ${input.meetingDate}`,
@@ -583,7 +725,7 @@ export async function saveMeeting(db: Database, input: SaveMeetingInput): Promis
     }
     const id = uid();
     await db.execute(
-      "INSERT INTO tasks (id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, notes, moved_count, parent_id, remind, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+      "INSERT INTO tasks (id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, repeat_anchor_day, notes, moved_count, parent_id, remind, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
       [
         id,
         meetingId,
@@ -598,6 +740,7 @@ export async function saveMeeting(db: Database, input: SaveMeetingInput): Promis
         0,
         task.evening ? 1 : 0,
         task.repeatRule,
+        repeatAnchor(task.repeatRule, task.dueOn, task.repeatAnchorDay),
         "",
         0,
         null,
@@ -616,6 +759,12 @@ export async function saveMeeting(db: Database, input: SaveMeetingInput): Promis
   const oldNoteLines = prior
     ? existing.bullets.filter((bullet) => bullet.ownerId === meetingId && bullet.kind === "note")
     : [];
+  const oldTopics = prior
+    ? existing.bullets.filter((bullet) => bullet.ownerId === meetingId && bullet.kind === "topic")
+    : [];
+  const oldQuestions = prior
+    ? existing.bullets.filter((bullet) => bullet.ownerId === meetingId && bullet.kind === "question")
+    : [];
   const noteText = (input.noteLines ?? [])
     .map((line) => `${"  ".repeat(line.indent)}${line.text.trim()}`)
     .filter((line) => line.trim())
@@ -629,17 +778,33 @@ export async function saveMeeting(db: Database, input: SaveMeetingInput): Promis
     "meeting",
     meetingId,
     "note",
-    [...oldNoteLines.map((bullet) => ({ text: bullet.body, indent: bullet.indent })), ...(input.noteLines ?? [])],
+    [...oldNoteLines.map((bullet) => ({ text: bullet.body, indent: bullet.indent, done: bullet.done, folded: bullet.folded })), ...(input.noteLines ?? [])],
   );
-  await replaceBullets(db, "meeting", meetingId, "topic", input.topics ?? []);
-  await replaceBullets(db, "meeting", meetingId, "question", input.questions ?? []);
+  await replaceBullets(
+    db,
+    "meeting",
+    meetingId,
+    "topic",
+    [...oldTopics.map((bullet) => ({ text: bullet.body, indent: bullet.indent, done: bullet.done, folded: bullet.folded })), ...(input.topics ?? [])],
+  );
+  await replaceBullets(
+    db,
+    "meeting",
+    meetingId,
+    "question",
+    [...oldQuestions.map((bullet) => ({ text: bullet.body, indent: bullet.indent, done: bullet.done, folded: bullet.folded })), ...(input.questions ?? [])],
+  );
+  const privateNote = input.privateNote?.trim() ? input.privateNote : prior?.privateNote ?? "";
+  const nextOn = input.nextOn?.trim() ? input.nextOn : prior?.nextOn ?? null;
+  const nextFocus = input.nextFocus?.trim() ? input.nextFocus : prior?.nextFocus ?? "";
+  const spanEnd = input.spanEnd?.trim() ? input.spanEnd : prior?.spanEnd ?? null;
   await db.execute(
     "UPDATE meetings SET private_note = $1, next_on = $2, next_focus = $3, span_end = $4, source_url = $5, calendar_uid = $6 WHERE id = $7",
     [
-      input.privateNote ?? "",
-      input.nextOn ?? null,
-      input.nextFocus ?? "",
-      input.spanEnd ?? null,
+      privateNote,
+      nextOn,
+      nextFocus,
+      spanEnd,
       input.sourceUrl ?? prior?.sourceUrl ?? "",
       input.calendarUid ?? prior?.calendarUid ?? "",
       meetingId,
@@ -665,15 +830,13 @@ export async function saveMeeting(db: Database, input: SaveMeetingInput): Promis
     await db.execute("UPDATE people SET check_in_on = $1 WHERE id = $2", [addDays(input.meetingDate, cadence), personId]);
   }
   await setSetting(db, "lastPersonId", personId);
-  return { meetingId, personId, createdPerson, taskCount };
-}
-
-export async function undoSave(db: Database, result: SaveMeetingResult, markDoneIds: string[]): Promise<void> {
-  for (const id of markDoneIds) {
-    await db.execute("UPDATE tasks SET status = 'open', completed_at = NULL WHERE id = $1", [id]);
+  if (saveId) {
+    await db.execute(
+      "INSERT INTO meeting_save_receipts (save_id, meeting_id, person_id, task_count, payload_hash) VALUES ($1, $2, $3, $4, $5)",
+      [saveId, meetingId, personId, taskCount, payloadHash],
+    );
   }
-  await deleteMeeting(db, result.meetingId);
-  if (result.createdPerson) await db.execute("DELETE FROM people WHERE id = $1", [result.personId]);
+  return { meetingId, personId, createdPerson, taskCount };
 }
 
 export async function addPerson(db: Database, name: string): Promise<string> {
@@ -816,21 +979,26 @@ export async function updateTaskTitle(db: Database, id: string, title: string): 
 }
 
 export async function updateTaskDue(db: Database, id: string, dueOn: string | null): Promise<void> {
-  const rows = await db.select<{ due_on: string | null }[]>("SELECT due_on FROM tasks WHERE id = $1", [id]);
-  const previous = rows[0]?.due_on ?? null;
+  const rows = await db.select<{ due_on: string | null; repeat_rule?: string | null; repeat_anchor_day?: number | null }[]>(
+    "SELECT due_on, repeat_rule, repeat_anchor_day FROM tasks WHERE id = $1",
+    [id],
+  );
+  const current = rows[0];
+  const previous = current?.due_on ?? null;
   const moved = previous !== dueOn ? 1 : 0;
-  await db.execute("UPDATE tasks SET due_on = $1, updated_at = $2, moved_count = moved_count + $3 WHERE id = $4", [
-    dueOn,
-    todayISO(),
-    moved,
-    id,
-  ]);
+  const anchorDay = repeatOf(current?.repeat_rule) === "monthly" && dueOn
+    ? repeatAnchor("monthly", dueOn)
+    : current?.repeat_anchor_day ?? null;
+  await db.execute(
+    "UPDATE tasks SET due_on = $1, repeat_anchor_day = $2, updated_at = $3, moved_count = moved_count + $4 WHERE id = $5",
+    [dueOn, anchorDay, todayISO(), moved, id],
+  );
   if (moved) await log(db, id, "due", dueOn ?? "No date");
 }
 
 export async function setTaskStatus(db: Database, id: string, status: TaskStatus): Promise<void> {
   const rows = await db.select<TaskRow[]>(
-    "SELECT id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, notes, moved_count, parent_id, remind, updated_at FROM tasks WHERE id = $1",
+    "SELECT id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, repeat_anchor_day, notes, moved_count, parent_id, remind, updated_at FROM tasks WHERE id = $1",
     [id],
   );
   const current = rows[0];
@@ -851,14 +1019,14 @@ export async function setTaskStatus(db: Database, id: string, status: TaskStatus
   if (status === "done" && rule) {
     const newId = uid();
     await db.execute(
-      "INSERT INTO tasks (id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, notes, moved_count, parent_id, remind, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+      "INSERT INTO tasks (id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, repeat_anchor_day, notes, moved_count, parent_id, remind, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
       [
         newId,
         current.meeting_id,
         current.requester_id,
         current.title,
         todayISO(),
-        nextDue(current.due_on, rule, todayISO()),
+        nextDue(current.due_on, rule, todayISO(), repeatAnchor(rule, current.due_on, current.repeat_anchor_day)),
         "open",
         null,
         now(),
@@ -866,6 +1034,7 @@ export async function setTaskStatus(db: Database, id: string, status: TaskStatus
         0,
         bit(current.evening) ? 1 : 0,
         rule,
+        repeatAnchor(rule, current.due_on, current.repeat_anchor_day),
         current.notes ?? "",
         0,
         current.parent_id,
@@ -934,7 +1103,17 @@ export async function patchTask(db: Database, id: string, patch: TaskPatch): Pro
     await db.execute("UPDATE tasks SET evening = $1, updated_at = $2 WHERE id = $3", [patch.evening ? 1 : 0, todayISO(), id]);
   }
   if (patch.repeatRule !== undefined) {
-    await db.execute("UPDATE tasks SET repeat_rule = $1, updated_at = $2 WHERE id = $3", [patch.repeatRule, todayISO(), id]);
+    const rows = await db.select<{ due_on: string | null; repeat_anchor_day: number | null }[]>(
+      "SELECT due_on, repeat_anchor_day FROM tasks WHERE id = $1",
+      [id],
+    );
+    const anchorDay = repeatAnchor(patch.repeatRule, rows[0]?.due_on, rows[0]?.repeat_anchor_day);
+    await db.execute("UPDATE tasks SET repeat_rule = $1, repeat_anchor_day = $2, updated_at = $3 WHERE id = $4", [
+      patch.repeatRule,
+      anchorDay,
+      todayISO(),
+      id,
+    ]);
   }
   if (patch.notes !== undefined) {
     await db.execute("UPDATE tasks SET notes = $1, updated_at = $2 WHERE id = $3", [patch.notes, todayISO(), id]);
@@ -1032,8 +1211,8 @@ export async function applyTask(db: Database, taskId: string, action: TaskAction
   if (!parent) return;
   const id = uid();
   await db.execute(
-    "INSERT INTO tasks (id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, notes, moved_count, parent_id, remind, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
-    [id, parent.meeting_id, parent.requester_id, title, todayISO(), null, "open", null, now(), "none", 0, 0, null, "", 0, taskId, 0, todayISO()],
+    "INSERT INTO tasks (id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, repeat_anchor_day, notes, moved_count, parent_id, remind, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+    [id, parent.meeting_id, parent.requester_id, title, todayISO(), null, "open", null, now(), "none", 0, 0, null, null, "", 0, taskId, 0, todayISO()],
   );
   await log(db, id, "created", "Subtask");
 }
@@ -1048,21 +1227,44 @@ export async function setManyDue(db: Database, ids: string[], dueOn: string | nu
 
 export async function deleteMeeting(db: Database, id: string): Promise<void> {
   const tasks = await db.select<{ id: string }[]>("SELECT id FROM tasks WHERE meeting_id = $1", [id]);
+  const captureTasks = await db.select<{ task_id: string }[]>(
+    "SELECT task_id FROM capture_entries WHERE meeting_id = $1 AND task_id != ''",
+    [id],
+  );
+  const retainedTaskIds = new Set(captureTasks.map((item) => item.task_id));
   for (const task of tasks) {
+    if (retainedTaskIds.has(task.id)) continue;
     await db.execute("DELETE FROM task_tags WHERE task_id = $1", [task.id]);
     await db.execute("DELETE FROM checks WHERE task_id = $1", [task.id]);
     await db.execute("DELETE FROM activity WHERE task_id = $1", [task.id]);
     await db.execute("DELETE FROM attachments WHERE task_id = $1", [task.id]);
   }
+  await db.execute(
+    "UPDATE tasks SET meeting_id = '' WHERE meeting_id = $1 AND id IN (SELECT task_id FROM capture_entries WHERE meeting_id = $1 AND task_id != '')",
+    [id],
+  );
+  await db.execute(
+    "UPDATE attachments SET meeting_id = '' WHERE meeting_id = $1 AND task_id IN (SELECT task_id FROM capture_entries WHERE meeting_id = $1 AND task_id != '')",
+    [id],
+  );
   await db.execute("DELETE FROM attachments WHERE meeting_id = $1", [id]);
+  await db.execute("UPDATE capture_entries SET meeting_id = '' WHERE meeting_id = $1", [id]);
   await db.execute("DELETE FROM decisions WHERE meeting_id = $1", [id]);
+  await db.execute("DELETE FROM meeting_save_receipts WHERE meeting_id = $1", [id]);
   await db.execute("DELETE FROM bullets WHERE owner_kind = 'meeting' AND owner_id = $1", [id]);
   await db.execute("DELETE FROM meeting_people WHERE meeting_id = $1", [id]);
   await db.execute("DELETE FROM tasks WHERE meeting_id = $1", [id]);
   await db.execute("DELETE FROM meetings WHERE id = $1", [id]);
 }
 
-type PersonSnapshot = {
+export type RequesterAssignmentSnapshot = {
+  taskId: string;
+  requesterId: string;
+  fallbackRequesterId: string;
+};
+
+export type PersonSnapshot = {
+  version: 2;
   person: Person;
   meetings: Meeting[];
   tasks: Task[];
@@ -1070,25 +1272,64 @@ type PersonSnapshot = {
   decisions: Decision[];
   attachments: Attachment[];
   activity: Activity[];
+  meetingBullets: Bullet[];
+  requesterAssignments: RequesterAssignmentSnapshot[];
+  captureAssignments?: { captureId: string; meetingId: string; taskId: string }[];
+  captureActorAssignments?: { captureId: string; actorId: string; taskId: string; taskRequesterId: string }[];
+  meetingSaveReceipts?: MeetingSaveReceipt[];
 };
 
-export async function deletePerson(db: Database, personId: string): Promise<void> {
-  const all = await loadAll(db);
-  const person = all.people.find((item) => item.id === personId);
-  if (!person) return;
-  const meetings = all.meetings.filter((meeting) => meeting.personId === personId);
+export function snapshotPersonForRemoval(data: Data, personId: string): PersonSnapshot | null {
+  const person = data.people.find((item) => item.id === personId);
+  if (!person) return null;
+  const meetings = data.meetings.filter((meeting) => meeting.personId === personId);
   const meetingIds = new Set(meetings.map((meeting) => meeting.id));
-  const tasks = all.tasks.filter((task) => meetingIds.has(task.meetingId));
+  const tasks = data.tasks.filter((task) => meetingIds.has(task.meetingId));
   const taskIds = new Set(tasks.map((task) => task.id));
-  const snapshot: PersonSnapshot = {
+  const hostByMeetingId = new Map(data.meetings.map((meeting) => [meeting.id, meeting.personId]));
+  const captureActorEntries = (data.captureEntries ?? []).filter((entry) => entry.kind === "theirs" && entry.actorId === personId);
+  const captureActorTaskIds = new Set(captureActorEntries.map((entry) => entry.taskId).filter(Boolean));
+  const requesterAssignments = data.tasks
+    .filter((task) => task.requesterId === personId && !meetingIds.has(task.meetingId) && !captureActorTaskIds.has(task.id))
+    .map((task) => ({
+      taskId: task.id,
+      requesterId: task.requesterId,
+      fallbackRequesterId: hostByMeetingId.get(task.meetingId) ?? task.requesterId,
+    }));
+  const captureAssignments = (data as DataWithCaptures).captureEntries
+    ?.filter((entry) => meetingIds.has(entry.meetingId))
+    .map((entry) => ({ captureId: entry.id, meetingId: entry.meetingId, taskId: entry.taskId })) ?? [];
+  const taskById = new Map(data.tasks.map((task) => [task.id, task]));
+  const captureActorAssignments = captureActorEntries.map((entry) => ({
+      captureId: entry.id,
+      actorId: entry.actorId,
+      taskId: entry.taskId,
+      taskRequesterId: taskById.get(entry.taskId)?.requesterId === personId ? personId : "",
+    }));
+  const meetingSaveReceipts = (data.meetingSaveReceipts ?? []).filter((receipt) => meetingIds.has(receipt.meetingId));
+
+  return {
+    version: 2,
     person,
     meetings,
     tasks,
-    checks: all.checks.filter((item) => taskIds.has(item.taskId)),
-    decisions: all.decisions.filter((item) => meetingIds.has(item.meetingId)),
-    attachments: all.attachments.filter((item) => taskIds.has(item.taskId ?? "") || meetingIds.has(item.meetingId ?? "")),
-    activity: all.activity.filter((item) => item.taskId !== null && taskIds.has(item.taskId)),
+    checks: data.checks.filter((item) => taskIds.has(item.taskId)),
+    decisions: data.decisions.filter((item) => meetingIds.has(item.meetingId)),
+    attachments: data.attachments.filter((item) => taskIds.has(item.taskId ?? "") || meetingIds.has(item.meetingId ?? "")),
+    activity: data.activity.filter((item) => item.taskId !== null && taskIds.has(item.taskId)),
+    meetingBullets: data.bullets.filter((item) => item.ownerKind === "meeting" && meetingIds.has(item.ownerId)),
+    requesterAssignments,
+    captureAssignments,
+    captureActorAssignments,
+    meetingSaveReceipts,
   };
+}
+
+export async function deletePerson(db: Database, personId: string): Promise<void> {
+  const all = await loadAll(db);
+  const snapshot = snapshotPersonForRemoval(all, personId);
+  if (!snapshot) return;
+  const { person, meetings } = snapshot;
   await db.execute("INSERT INTO removed_people (id, name, snapshot, removed_at) VALUES ($1, $2, $3, $4)", [
     personId,
     person.name,
@@ -1096,14 +1337,24 @@ export async function deletePerson(db: Database, personId: string): Promise<void
     now(),
   ]);
   for (const meeting of meetings) await deleteMeeting(db, meeting.id);
-  const leftover = await db.select<{ id: string; meeting_id: string }[]>(
-    "SELECT id, meeting_id FROM tasks WHERE requester_id = $1",
-    [personId],
-  );
-  for (const task of leftover) {
-    const hosts = await db.select<{ person_id: string }[]>("SELECT person_id FROM meetings WHERE id = $1", [task.meeting_id]);
-    const host = hosts[0]?.person_id;
-    if (host) await db.execute("UPDATE tasks SET requester_id = $1 WHERE id = $2", [host, task.id]);
+  for (const assignment of snapshot.requesterAssignments) {
+    if (assignment.fallbackRequesterId === assignment.requesterId) continue;
+    await db.execute(
+      "UPDATE tasks SET requester_id = $1 WHERE id = $2 AND requester_id = $3",
+      [assignment.fallbackRequesterId, assignment.taskId, assignment.requesterId],
+    );
+  }
+  for (const assignment of snapshot.captureActorAssignments ?? []) {
+    await db.execute(
+      "UPDATE capture_entries SET actor_id = '' WHERE id = $1 AND actor_id = $2 AND kind = 'theirs'",
+      [assignment.captureId, assignment.actorId],
+    );
+    if (assignment.taskId && assignment.taskRequesterId) {
+      await db.execute(
+        "UPDATE tasks SET requester_id = '' WHERE id = $1 AND requester_id = $2",
+        [assignment.taskId, assignment.taskRequesterId],
+      );
+    }
   }
   await db.execute("DELETE FROM people WHERE id = $1", [personId]);
 }
@@ -1155,7 +1406,7 @@ async function insertMeeting(db: Database, meeting: Meeting): Promise<void> {
 
 async function insertTask(db: Database, task: Task): Promise<void> {
   await db.execute(
-    "INSERT INTO tasks (id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, notes, moved_count, parent_id, remind, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+    "INSERT INTO tasks (id, meeting_id, requester_id, title, requested_on, due_on, status, completed_at, created_at, priority, pinned, evening, repeat_rule, repeat_anchor_day, notes, moved_count, parent_id, remind, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
     [
       task.id,
       task.meetingId,
@@ -1170,6 +1421,7 @@ async function insertTask(db: Database, task: Task): Promise<void> {
       task.pinned ? 1 : 0,
       task.evening ? 1 : 0,
       task.repeatRule,
+      repeatAnchor(task.repeatRule, task.dueOn, task.repeatAnchorDay),
       task.notes,
       task.movedCount,
       task.parentId,
@@ -1217,8 +1469,14 @@ export async function restoreRemoved(db: Database, id: string): Promise<void> {
   if (existing.length > 0) throw new Error("That person is already here.");
   await insertPerson(db, snap.person);
   for (const meeting of snap.meetings) await insertMeeting(db, meeting);
-  for (const task of snap.tasks) await insertTask(db, task);
+  const existingTaskIds = new Set<string>();
+  for (const task of snap.tasks) {
+    const taskExists = await db.select<{ id: string }[]>("SELECT id FROM tasks WHERE id = $1", [task.id]);
+    if (taskExists.length) existingTaskIds.add(task.id);
+    else await insertTask(db, task);
+  }
   for (const check of snap.checks) {
+    if (existingTaskIds.has(check.taskId)) continue;
     await db.execute("INSERT INTO checks (id, task_id, title, done, position) VALUES ($1, $2, $3, $4, $5)", [
       check.id,
       check.taskId,
@@ -1228,20 +1486,29 @@ export async function restoreRemoved(db: Database, id: string): Promise<void> {
     ]);
   }
   for (const decision of snap.decisions) {
-    await db.execute("INSERT INTO decisions (id, meeting_id, body, created_at) VALUES ($1, $2, $3, $4)", [
+    await db.execute("INSERT INTO decisions (id, meeting_id, body, created_at, why) VALUES ($1, $2, $3, $4, $5)", [
       decision.id,
       decision.meetingId,
       decision.body,
       decision.createdAt,
+      decision.why ?? "",
     ]);
   }
+  for (const bullet of snap.meetingBullets ?? []) {
+    await db.execute(
+      "INSERT INTO bullets (id, owner_kind, owner_id, kind, body, indent, position, done, folded) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+      [bullet.id, bullet.ownerKind, bullet.ownerId, bullet.kind, bullet.body, bullet.indent, bullet.position, bullet.done ? 1 : 0, bullet.folded ? 1 : 0],
+    );
+  }
   for (const file of snap.attachments) {
+    if (file.taskId && existingTaskIds.has(file.taskId)) continue;
     await db.execute(
       "INSERT INTO attachments (id, task_id, meeting_id, name, path, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
       [file.id, file.taskId, file.meetingId, file.name, file.path, file.createdAt],
     );
   }
   for (const item of snap.activity) {
+    if (item.taskId && existingTaskIds.has(item.taskId)) continue;
     await db.execute("INSERT INTO activity (id, task_id, kind, detail, created_at) VALUES ($1, $2, $3, $4, $5)", [
       item.id,
       item.taskId,
@@ -1250,11 +1517,47 @@ export async function restoreRemoved(db: Database, id: string): Promise<void> {
       item.createdAt,
     ]);
   }
+  for (const assignment of snap.captureAssignments ?? []) {
+    if (assignment.taskId) {
+      await db.execute("UPDATE tasks SET meeting_id = $1 WHERE id = $2 AND meeting_id = ''", [assignment.meetingId, assignment.taskId]);
+    }
+    await db.execute("UPDATE capture_entries SET meeting_id = $1 WHERE id = $2 AND meeting_id = ''", [
+      assignment.meetingId,
+      assignment.captureId,
+    ]);
+  }
+  for (const assignment of snap.captureActorAssignments ?? []) {
+    await db.execute(
+      "UPDATE capture_entries SET actor_id = $1 WHERE id = $2 AND actor_id = '' AND kind = 'theirs'",
+      [assignment.actorId, assignment.captureId],
+    );
+    if (assignment.taskId && assignment.taskRequesterId) {
+      await db.execute(
+        "UPDATE tasks SET requester_id = $1 WHERE id = $2 AND requester_id = '' AND EXISTS (SELECT 1 FROM capture_entries WHERE id = $3 AND actor_id = '' AND kind = 'theirs')",
+        [assignment.taskRequesterId, assignment.taskId, assignment.captureId],
+      );
+    }
+  }
+  for (const receipt of snap.meetingSaveReceipts ?? []) {
+    await db.execute(
+      "INSERT INTO meeting_save_receipts (save_id, meeting_id, person_id, task_count, payload_hash) VALUES ($1, $2, $3, $4, $5)",
+      [receipt.saveId, receipt.meetingId, receipt.personId, receipt.taskCount, receipt.payloadHash ?? null],
+    );
+  }
+  for (const assignment of snap.requesterAssignments ?? []) {
+    if (assignment.requesterId === assignment.fallbackRequesterId) continue;
+    await db.execute(
+      "UPDATE tasks SET requester_id = $1 WHERE id = $2 AND requester_id = $3",
+      [assignment.requesterId, assignment.taskId, assignment.fallbackRequesterId],
+    );
+  }
   await db.execute("DELETE FROM removed_people WHERE id = $1", [id]);
 }
 
 async function clearAll(db: Database): Promise<void> {
   const tables = [
+    "meeting_save_receipts",
+    "capture_entries",
     "task_tags",
     "checks",
     "activity",
@@ -1280,7 +1583,7 @@ async function clearAll(db: Database): Promise<void> {
   for (const table of tables) await db.execute(`DELETE FROM ${table}`);
 }
 
-export async function replaceAll(db: Database, data: Data): Promise<void> {
+export async function replaceAll(db: Database, data: DataWithCaptures): Promise<void> {
   await clearAll(db);
   for (const company of data.companies) {
     await db.execute("INSERT INTO companies (id, name) VALUES ($1, $2)", [company.id, company.name]);
@@ -1299,11 +1602,12 @@ export async function replaceAll(db: Database, data: Data): Promise<void> {
     ]);
   }
   for (const decision of data.decisions) {
-    await db.execute("INSERT INTO decisions (id, meeting_id, body, created_at) VALUES ($1, $2, $3, $4)", [
+    await db.execute("INSERT INTO decisions (id, meeting_id, body, created_at, why) VALUES ($1, $2, $3, $4, $5)", [
       decision.id,
       decision.meetingId,
       decision.body,
       decision.createdAt,
+      decision.why ?? "",
     ]);
   }
   for (const file of data.attachments) {
@@ -1405,6 +1709,18 @@ export async function replaceAll(db: Database, data: Data): Promise<void> {
   }
   for (const log of data.logs ?? []) {
     await db.execute("INSERT INTO day_logs (id, on_date, kind, body) VALUES ($1, $2, $3, $4)", [log.id, log.onDate, log.kind, log.body]);
+  }
+  for (const entry of data.captureEntries ?? []) {
+    await db.execute(
+      "INSERT INTO capture_entries (id, body, created_at, timezone, offset_min, kind, actor_id, meeting_id, task_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+      [entry.id, entry.body, entry.createdAt, entry.timezone, entry.offsetMin, entry.kind, entry.actorId, entry.meetingId, entry.taskId],
+    );
+  }
+  for (const receipt of data.meetingSaveReceipts ?? []) {
+    await db.execute(
+      "INSERT INTO meeting_save_receipts (save_id, meeting_id, person_id, task_count, payload_hash) VALUES ($1, $2, $3, $4, $5)",
+      [receipt.saveId, receipt.meetingId, receipt.personId, receipt.taskCount, receipt.payloadHash ?? null],
+    );
   }
   for (const [key, value] of settings) {
     await setSetting(db, key, value);

@@ -1,5 +1,7 @@
 # More ideas
 
+Status, 6 November 2026: this is the archived 1 November feature inventory. The current app opens in D — Workspace; Insights keeps the earlier charts. Command-Shift-N now opens Quick capture. See [Workspace release](workspace-release.md) for current behavior, design references and integration limits.
+
 These are in the app. Home opens on the counts and the bar charts. Notes are bullets, separate from tasks. Tab indents a bullet. Shift-Tab pulls it back. Due dates offer EOD, Tomorrow, In 2 Days, EOW, and Next Week.
 
 Two limits stay. The Mac Dock cannot grow a menu from this app, so that list lives in the menu bar. The desktop card is a small window, not a Mac widget. Command-Shift-N logs a meeting. Command-Shift-Y says what is due. Spotlight can find the file named Due today in Documents.

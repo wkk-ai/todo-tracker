@@ -4253,6 +4253,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sqlx",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -4260,6 +4261,8 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "tauri-plugin-sql",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

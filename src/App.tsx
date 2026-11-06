@@ -27,7 +27,6 @@ import {
   setManyStatus,
   patchTask,
   setSetting,
-  undoSave,
   updateGuests,
   updateMeeting,
   updatePerson,
@@ -35,12 +34,12 @@ import {
   updateTaskDue,
   updateTaskTitle,
   type SaveMeetingInput,
-  type SaveMeetingResult,
   type TaskAction,
 } from "./db";
 import {
   addDays,
   agendaFromIcs,
+  calendarEventMatches,
   boardCsv,
   boardText,
   groupOpen,
@@ -56,6 +55,9 @@ import {
 } from "./logic";
 import { Icon } from "./icons";
 import { Dashboard } from "./Dashboard";
+import { Workspace, type WorkspacePage } from "./Workspace";
+import { TaskInspector } from "./TaskInspector";
+import { saveCapture, correctCapture } from "./capture";
 import { MeetingSheet } from "./MeetingSheet";
 import { People } from "./People";
 import { PersonPage } from "./PersonPage";
@@ -69,6 +71,7 @@ import {
   type CalEvent,
   notifyDue,
   onLogMeeting,
+  onQuickCapture,
   onShowPerson,
   cardFromUrl,
   onSayDue,
@@ -84,10 +87,16 @@ import {
   watchClose,
   writeSpotlight,
 } from "./native";
-import type Database from "@tauri-apps/plugin-sql";
+import { transaction, type Database } from "./database";
+import { SafeHistory } from "./history";
+import { mergeCalendarEvents, SingleFlight } from "./calendarSync";
 
 type Screen =
   | { name: "home" }
+  | { name: "capture" }
+  | { name: "meetings" }
+  | { name: "knowledge" }
+  | { name: "planning" }
   | { name: "people" }
   | { name: "person"; personId: string; meetingId?: string }
   | { name: "review" }
@@ -104,6 +113,7 @@ export default function App() {
   const [db, setDb] = useState<Database | null>(null);
   const [data, setData] = useState<Data | null>(null);
   const [error, setError] = useState("");
+  const [startupAttempt, setStartupAttempt] = useState(0);
   const [screen, setScreen] = useState<Screen>(() => {
     const personId = personFromUrl();
     return personId ? { name: "person", personId } : { name: "home" };
@@ -139,12 +149,18 @@ export default function App() {
   const [today, setToday] = useState(todayISO);
   const [events, setEvents] = useState<CalEvent[]>([]);
   const [agendaError, setAgendaError] = useState("");
+  const [agendaVersion, setAgendaVersion] = useState(0);
+  const calendarFlight = useRef(new SingleFlight<CalEvent[]>());
   const [agendaPick, setAgendaPick] = useState<CalEvent | null>(null);
   const [palette, setPalette] = useState<string | null>(null);
+  const [inspectedTaskId, setInspectedTaskId] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
   const toastTimer = useRef<number | null>(null);
-  const undoStack = useRef<string[]>([]);
-  const redoStack = useRef<string[]>([]);
+  const historyRef = useRef<SafeHistory<Data, Database> | null>(null);
+  if (!historyRef.current) historyRef.current = new SafeHistory(transaction, loadAll, async (database, snapshot) => {
+    const current = await loadAll(database);
+    await replaceAll(database, { ...snapshot, settings: { ...snapshot.settings, backupPath: current.settings.backupPath } });
+  }, (snapshot) => ({ ...snapshot, settings: { ...snapshot.settings, backupPath: "" } }));
   const dataRef = useRef(data);
   const dbRef = useRef(db);
   const dirtyRef = useRef(false);
@@ -152,8 +168,8 @@ export default function App() {
   dbRef.current = db;
   dirtyRef.current = sheetOpen && sheetDirty;
 
-  const refresh = useCallback(async (database: Database) => {
-    const next = await loadAll(database);
+  const refresh = useCallback(async (_database: Database) => {
+    const next = await transaction(loadAll);
     setData(next);
     return next;
   }, []);
@@ -165,64 +181,50 @@ export default function App() {
   }, []);
 
   const mutate = useCallback(
-    async <T,>(work: (database: Database) => Promise<T>): Promise<T | undefined> => {
-      const database = dbRef.current;
-      const current = dataRef.current;
-      if (!database || !current) return;
-      const before = JSON.stringify(current);
+    async <T,>(work: (database: Database) => Promise<T>, options: { throwOnError?: boolean; onCommit?: (id: number | null) => void } = {}): Promise<T | undefined> => {
+      if (!dbRef.current) {
+        if (options.throwOnError) throw new Error("Your saved tasks have not opened yet. Your draft is still here.");
+        return;
+      }
       try {
-        const result = await work(database);
-        const after = await loadAll(database);
-        const serialized = JSON.stringify(after);
-        if (serialized !== before) {
-          undoStack.current.push(before);
-          if (undoStack.current.length > 40) undoStack.current.shift();
-          redoStack.current = [];
-        }
-        setData(after);
-        return result;
+        const result = await historyRef.current!.mutate(work);
+        setData(result.state);
+        options.onCommit?.(result.undoId);
+        return result.value;
       } catch (caught) {
+        if (dbRef.current) await refresh(dbRef.current).catch(() => undefined);
         showToast({ message: caught instanceof Error ? caught.message : "That did not save.", undo: null }, 5000);
+        if (options.throwOnError) throw caught;
       }
     },
-    [showToast],
+    [refresh, showToast],
   );
 
-  const undo = useCallback(async () => {
-    const database = dbRef.current;
-    const current = dataRef.current;
-    const snap = undoStack.current.pop();
-    if (!database || !current || !snap) return;
-    redoStack.current.push(JSON.stringify(current));
+  const undo = useCallback(async (expectedId?: number) => {
     try {
-      await replaceAll(database, JSON.parse(snap) as Data);
-      setData(await loadAll(database));
+      const state = await historyRef.current!.undo(expectedId);
+      if (state) setData(state);
     } catch (caught) {
-      undoStack.current.push(snap);
-      showToast({ message: caught instanceof Error ? caught.message : "Could not undo.", undo: null }, 5000);
+      showToast({ message: caught instanceof Error ? caught.message : "Could not undo.", undo: null }, 6000);
+      if (dbRef.current) await refresh(dbRef.current).catch(() => undefined);
     }
-  }, [showToast]);
+  }, [refresh, showToast]);
 
   const redo = useCallback(async () => {
-    const database = dbRef.current;
-    const current = dataRef.current;
-    const snap = redoStack.current.pop();
-    if (!database || !current || !snap) return;
-    undoStack.current.push(JSON.stringify(current));
     try {
-      await replaceAll(database, JSON.parse(snap) as Data);
-      setData(await loadAll(database));
+      const state = await historyRef.current!.redo();
+      if (state) setData(state);
     } catch (caught) {
-      redoStack.current.push(snap);
-      showToast({ message: caught instanceof Error ? caught.message : "Could not redo.", undo: null }, 5000);
+      showToast({ message: caught instanceof Error ? caught.message : "Could not redo.", undo: null }, 6000);
+      if (dbRef.current) await refresh(dbRef.current).catch(() => undefined);
     }
-  }, [showToast]);
+  }, [refresh, showToast]);
 
   useEffect(() => {
     let alive = true;
     openDatabase()
       .then(async (database) => {
-        const all = await loadAll(database);
+        const all = await transaction(loadAll);
         if (!alive) return;
         setDb(database);
         setData(all);
@@ -234,13 +236,14 @@ export default function App() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [startupAttempt]);
 
   useEffect(() => {
     const update = () => {
       setToday(todayISO());
+      setAgendaVersion((value) => value + 1);
       const database = dbRef.current;
-      if (database) void refresh(database);
+      if (database) void refresh(database).catch(() => showToast({ message: "Saved tasks could not refresh. Try again when this window is active.", undo: null }, 5000));
     };
     window.addEventListener("focus", update);
     const id = window.setInterval(() => setToday(todayISO()), 60_000);
@@ -248,7 +251,7 @@ export default function App() {
       window.removeEventListener("focus", update);
       window.clearInterval(id);
     };
-  }, [refresh]);
+  }, [refresh, showToast]);
 
   useEffect(() => {
     if (!data) return;
@@ -269,49 +272,58 @@ export default function App() {
   }, [data, today]);
 
   useEffect(() => {
-    const url = data?.settings.googleIcal ?? "";
+    if (!data) return;
+    const url = data.settings.googleIcal;
     let gone = false;
-    void (async () => {
+    void calendarFlight.current.run(url + "|" + today, async () => {
       const mac = await loadCalendar();
-      let google: CalEvent[] = [];
-      if (url) {
-        try {
-          google = agendaFromIcs(await fetchGoogleCalendar(url), todayISO());
-          if (!gone) setAgendaError("");
-        } catch (caught) {
-          if (!gone) setAgendaError(caught instanceof Error ? caught.message : "Google Calendar did not answer.");
-        }
-      } else if (!gone) {
-        setAgendaError("");
-      }
+      const google = url ? await agendaFromIcs(await fetchGoogleCalendar(url), today) : [];
+      return mergeCalendarEvents(google, mac);
+    }).then((next) => {
       if (gone) return;
-      const seen = new Set(google.map((event) => `${event.date}|${event.title.toLowerCase()}`));
-      setEvents([...google, ...mac.filter((event) => !seen.has(`${event.date}|${event.title.toLowerCase()}`))]);
-    })();
-    return () => {
-      gone = true;
-    };
-  }, [data?.settings.googleIcal]);
+      setEvents(next);
+      setAgendaError("");
+    }).catch(() => {
+      if (!gone) setAgendaError("Calendar could not refresh. Previously loaded meetings are still shown. Try Refresh.");
+    });
+    return () => { gone = true; };
+  }, [data?.settings.googleIcal, today, agendaVersion]);
 
   useEffect(() => {
-    const database = db;
-    if (!database) return;
-    const key = `todo-tracker.backup.${todayISO()}`;
-    if (localStorage.getItem(key)) return;
-    localStorage.setItem(key, "1");
-    void backupNow(`todo-tracker-${todayISO()}.db`)
-      .then(async (path) => {
-        await setSetting(database, "backupPath", path);
-        if (dbRef.current) setData(await loadAll(dbRef.current));
-      })
-      .catch(() => undefined);
-  }, [db]);
+    const id = window.setInterval(() => setAgendaVersion((value) => value + 1), 10 * 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    if (!db) return;
+    let stopped = false;
+    let inFlight = false;
+    const attempt = async () => {
+      const key = `todo-tracker.backup.v2.${todayISO()}`;
+      if (inFlight || localStorage.getItem(key)) return;
+      inFlight = true;
+      try {
+        const path = await backupNow(`todo-tracker-${todayISO()}.db`);
+        await transaction((database) => setSetting(database, "backupPath", path));
+        localStorage.setItem(key, "1");
+        if (!stopped && dbRef.current) await refresh(dbRef.current);
+      } catch {
+        if (!stopped) showToast({ message: "Automatic backup could not finish. It will retry; you can also back up in Settings.", undo: null }, 6000);
+      } finally {
+        inFlight = false;
+      }
+    };
+    void attempt();
+    const retry = window.setInterval(() => void attempt(), 15 * 60_000);
+    window.addEventListener("focus", attempt);
+    return () => { stopped = true; window.clearInterval(retry); window.removeEventListener("focus", attempt); };
+  }, [db, today, refresh, showToast]);
 
   useEffect(() => {
     if (!data) return;
     for (const task of data.tasks) {
       if (!task.remind || task.dueOn !== today) continue;
-      if (task.status === "done" || task.status === "set_aside") continue;
+      if (task.status === "done" || task.status === "set_aside" || task.status === "void") continue;
       const key = `todo-tracker.reminded.${task.id}.${today}`;
       if (localStorage.getItem(key)) continue;
       localStorage.setItem(key, "1");
@@ -337,44 +349,40 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    void onLogMeeting(() => openSheet(null)).then((fn) => {
-      unlisten = fn;
-    });
+    let stopped = false;
+    const listeners: (() => void)[] = [];
+    const keep = (fn: () => void) => { if (stopped) fn(); else listeners.push(fn); };
+    void onLogMeeting(() => openSheet(null)).then(keep);
     void onShowPerson((personId) => {
       setQuery("");
       openScreen({ name: "person", personId });
-    }).then((fn) => {
-      const previous = unlisten;
-      unlisten = () => {
-        previous?.();
-        fn();
-      };
-    });
-    void watchClose(() => dirtyRef.current).then((fn) => {
-      const previous = unlisten;
-      unlisten = () => {
-        previous?.();
-        fn();
-      };
-    });
-    return () => unlisten?.();
-  }, [openSheet]);
+    }).then(keep);
+    void watchClose(() => dirtyRef.current).then(keep);
+    return () => { stopped = true; listeners.forEach((stop) => stop()); };
+  }, [openScreen, openSheet]);
 
   useEffect(() => {
+    let stopped = false;
+    let unlisten = () => undefined as void;
+    void onQuickCapture(() => { setQuery(""); openScreen({ name: "capture" }); }).then((stop) => {
+      if (stopped) stop(); else unlisten = stop;
+    });
+    return () => { stopped = true; unlisten(); };
+  }, [openScreen]);
+
+  useEffect(() => {
+    let stopped = false;
     let stop = () => undefined as void;
     void onShowTask((taskId) => {
       const current = dataRef.current;
       const task = current?.tasks.find((item) => item.id === taskId);
       if (!task) return;
-      const meeting = current?.meetings.find((item) => item.id === task.meetingId);
       setQuery("");
-      if (meeting) openScreen({ name: "person", personId: meeting.personId, meetingId: meeting.id });
-      else if (task.requesterId) openScreen({ name: "person", personId: task.requesterId });
+      setInspectedTaskId(task.id);
     }).then((fn) => {
-      stop = fn;
+      if (stopped) fn(); else stop = fn;
     });
-    return () => stop();
+    return () => { stopped = true; stop(); };
   }, []);
 
   useEffect(() => {
@@ -430,7 +438,8 @@ export default function App() {
       const key = event.key.toLowerCase();
       if (meta && key === "n" && !event.shiftKey) {
         event.preventDefault();
-        openSheet(screen.name === "person" ? screen.personId : null);
+        setQuery("");
+        openScreen({ name: "capture" });
       } else if (meta && key === "f") {
         event.preventDefault();
         searchRef.current?.focus();
@@ -458,7 +467,7 @@ export default function App() {
         window.print();
       } else if (meta && event.shiftKey && key === "v" && !typing) {
         event.preventDefault();
-        void navigator.clipboard.readText().then((text) => {
+        void navigator.clipboard.readText().then(async (text) => {
           const line = text
             .split("\n")
             .map((item) => item.trim())
@@ -467,12 +476,12 @@ export default function App() {
           if (!line || !current) return;
           const latest = [...current.meetings].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
           const personId = current.settings.onlyPersonId || latest?.personId || null;
-          void mutate((database) => addLooseTask(database, personId, line, text));
+          await mutate((database) => addLooseTask(database, personId, line, text), { throwOnError: true });
           showToast(
             { message: personId ? "Saved that line for the last person." : "Saved that line in the catch pile.", undo: null },
             4000,
           );
-        });
+        }).catch(() => showToast({ message: "Could not save that clipboard text. Please try again.", undo: null }, 4000));
       } else if (meta && key === "z") {
         if (typing) return;
         event.preventDefault();
@@ -488,11 +497,8 @@ export default function App() {
   }, [goBack, openScreen, openSheet, redo, screen, sheetOpen, undo]);
 
   function openTask(task: Task) {
-    const meeting = data?.meetings.find((item) => item.id === task.meetingId);
     setQuery("");
-    if (meeting) openScreen({ name: "person", personId: meeting.personId, meetingId: meeting.id });
-    else if (task.requesterId) openScreen({ name: "person", personId: task.requesterId });
-    else openScreen({ name: "someday" });
+    setInspectedTaskId(task.id);
   }
 
   async function onTask(task: Task, action: TaskAction) {
@@ -513,16 +519,19 @@ export default function App() {
   }
 
   async function onSave(input: SaveMeetingInput) {
-    if (!db || !data) return;
+    if (!db || !data) throw new Error("Your saved tasks have not opened yet. Your draft is still here.");
     const keep = data.settings.keepSheetOpen;
     setBusy(true);
     try {
-      const result = await mutate((database) => saveMeeting(database, input));
-      if (!result) return;
+      let saveUndoId: number | null = null;
+      const result = await mutate((database) => saveMeeting(database, input), { throwOnError: true, onCommit: (id) => { saveUndoId = id; } });
+      if (!result) throw new Error("That did not save. Your draft is still here.");
       setQuery("");
       if (!keep) {
         setSheetOpen(false);
-        openScreen({ name: "person", personId: result.personId });
+        if (!["home", "capture", "meetings", "knowledge"].includes(screenRef.current.name)) {
+          openScreen({ name: "person", personId: result.personId });
+        }
       }
       showToast(
         {
@@ -530,8 +539,8 @@ export default function App() {
             events.filter((item) => item.date === input.meetingDate).length >= 3
               ? `${savedLine(result.taskCount)} That day already looks full.`
               : savedLine(result.taskCount),
-          undo: async () => {
-            await undoMeeting(result, input.markDoneIds);
+          undo: saveUndoId === null ? null : async () => {
+            await undo(saveUndoId!);
           },
         },
         8000,
@@ -539,13 +548,6 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }
-
-  async function undoMeeting(result: SaveMeetingResult, markDoneIds: string[]) {
-    if (!db) return;
-    await undoSave(db, result, markDoneIds);
-    await refresh(db);
-    if (result.createdPerson) openScreen({ name: "home" });
   }
 
   async function exportText(contents: string, name: string) {
@@ -562,7 +564,6 @@ export default function App() {
   }
 
   const searching = query.trim().length > 0;
-  const personId = screen.name === "person" || screen.name === "brief" ? screen.personId : null;
   const focusId = new URLSearchParams(window.location.search).get("task");
 
   if (focusId && data) {
@@ -596,28 +597,26 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div className="app workspace-app">
       <aside className="sidebar no-print">
         <div className="brand">To-Do Tracker</div>
         <label className="search">
           <span className="sr-only">Search</span>
           <input ref={searchRef} placeholder="Search" value={query} onChange={(event) => setQuery(event.target.value)} />
         </label>
-        <nav className="nav">
+        <nav className="nav" aria-label="Main navigation">
           {(
             [
-              ["home", "Home", "home", "progress"],
-              ["people", "People", "people", "day"],
-              ["review", "Review", "list", "pin"],
-              ["archive", "Set aside", "box", "aside"],
-              ["day", "Today", "sun", "eod"],
-              ["boxes", "Four boxes", "squares", "week"],
-              ["someday", "Someday", "cloud", "evening"],
+              ["home", "Today", "sun"],
+              ["capture", "Capture", "plus"],
+              ["meetings", "Meetings", "calendar"],
+              ["knowledge", "Knowledge", "link"],
             ] as const
-          ).map(([name, label, icon, tone]) => (
+          ).map(([name, label, icon]) => (
             <button
               key={name}
-              className={screen.name === name && !searching ? `nav-button tone-${tone} active` : `nav-button tone-${tone}`}
+              className={screen.name === name && !searching ? "nav-button active" : "nav-button"}
+              aria-current={screen.name === name && !searching ? "page" : undefined}
               onClick={() => {
                 setQuery("");
                 openScreen({ name } as Screen);
@@ -628,13 +627,23 @@ export default function App() {
             </button>
           ))}
         </nav>
-        <button className="primary sidebar-action" onClick={() => openSheet(personId)}>
+        <button className="primary sidebar-action" onClick={() => { setQuery(""); openScreen({ name: "capture" }); }}>
           <span className="with-icon">
             <Icon name="plus" />
-            Log a meeting
+            Quick capture
           </span>
           <kbd className="kbd">⌘N</kbd>
         </button>
+        <button className={screen.name === "people" ? "nav-button active" : "nav-button"} onClick={() => { setQuery(""); openScreen({ name: "people" }); }}><Icon name="people" />People</button>
+        <details className="workspace-more">
+          <summary>Planning &amp; history</summary>
+          <nav className="nav" aria-label="Planning and history">
+            {([
+              ["planning", "Insights", "home"], ["review", "Review", "list"], ["archive", "Set aside", "box"],
+              ["day", "Daily log", "sun"], ["boxes", "Four boxes", "squares"], ["someday", "Someday", "cloud"],
+            ] as const).map(([name, label, icon]) => <button key={name} className={screen.name === name && !searching ? "nav-button active" : "nav-button"} onClick={() => { setQuery(""); openScreen({ name }); }}><Icon name={icon} />{label}</button>)}
+          </nav>
+        </details>
         <button
           className={screen.name === "settings" ? "nav-button tone-none active" : "nav-button tone-none"}
           onClick={() => {
@@ -647,12 +656,12 @@ export default function App() {
         </button>
       </aside>
       <main className="main">
-        <div className="main-inner">
+        <div className={["home", "capture", "meetings", "knowledge"].includes(screen.name) ? "main-inner workspace-page" : "main-inner"}>
           <button className="back no-print" type="button" onClick={goBack} disabled={!canBack}>
             <Icon name="back" />
             Back
           </button>
-          {error && <p className="error-banner">The app could not open your saved tasks. {error}</p>}
+          {error && <div className="error-banner" role="alert"><p>The app could not open your saved tasks. {error}</p><button type="button" onClick={() => { setError(""); setStartupAttempt((attempt) => attempt + 1); }}>Try again</button></div>}
           {!error && !data && <Skeleton />}
           {data && searching && (
             <SearchResults
@@ -664,15 +673,27 @@ export default function App() {
               }}
             />
           )}
-          {data && !searching && screen.name === "home" && (
+          {data && !searching && ["home", "capture", "meetings", "knowledge"].includes(screen.name) && (
+            <Workspace data={data} page={(screen.name === "home" ? "today" : screen.name) as WorkspacePage} today={today} events={events} agendaError={agendaError}
+              onRefreshAgenda={() => setAgendaVersion((value) => value + 1)}
+              onOpenTask={openTask} onAction={(task, action) => void onTask(task, action)}
+              onOpenMeeting={(meeting) => { setQuery(""); openScreen({ name: "person", personId: meeting.personId, meetingId: meeting.id }); }}
+              onLog={(event) => openSheet(null, event?.date, event)}
+              onGoCapture={() => { setQuery(""); openScreen({ name: "capture" }); }}
+              onCapture={async (entry) => { await mutate(async (database) => saveCapture(database, entry, await loadAll(database)), { throwOnError: true }); }}
+              onCorrect={async (entry, patch) => { await mutate((database) => correctCapture(database, entry, patch), { throwOnError: true }); }}
+            />
+          )}
+          {data && !searching && screen.name === "planning" && (
           <Dashboard
             data={data}
             today={today}
             events={events}
             googleConnected={Boolean(data.settings.googleIcal)}
             agendaError={agendaError}
+            onRefreshAgenda={() => setAgendaVersion((value) => value + 1)}
             onOpenAgenda={(event) => {
-              const linked = data.meetings.find((meeting) => meeting.calendarUid && meeting.calendarUid === event.id);
+              const linked = data.meetings.find((meeting) => calendarEventMatches(meeting, event));
               if (linked) {
                 setQuery("");
                 openScreen({ name: "person", personId: linked.personId, meetingId: linked.id });
@@ -845,7 +866,7 @@ export default function App() {
               onCard={() => void openCard()}
               onBackup={() =>
                 void backupNow(`todo-tracker-${today}.db`)
-                  .then((path) => mutate((database) => setSetting(database, "backupPath", path)))
+                  .then((path) => mutate((database) => setSetting(database, "backupPath", path), { throwOnError: true }))
                   .then(() => showToast({ message: "Backup saved on this Mac.", undo: null }, 4000))
                   .catch((caught: unknown) =>
                     showToast({ message: caught instanceof Error ? caught.message : "Could not back up.", undo: null }, 5000),
@@ -893,6 +914,10 @@ export default function App() {
           onToggleTheme={() => setting("theme", data.settings.theme === "dark" ? "light" : "dark")}
           onToggleType={() => setting("typeSize", data.settings.typeSize === "large" ? "normal" : "large")}
         />
+      )}
+      {data && inspectedTaskId && data.tasks.find((task) => task.id === inspectedTaskId) && (
+        <TaskInspector key={inspectedTaskId} task={data.tasks.find((task) => task.id === inspectedTaskId)!} data={data} today={today}
+          onAction={(action) => void onTask(data.tasks.find((task) => task.id === inspectedTaskId)!, action)} onClose={() => setInspectedTaskId("")} />
       )}
       {toast && (
         <div className="toast" role="status">

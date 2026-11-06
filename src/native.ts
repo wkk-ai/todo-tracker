@@ -2,14 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   isPermissionGranted,
   requestPermission,
   sendNotification,
 } from "@tauri-apps/plugin-notification";
 
-export type CalEvent = { id: string; date: string; time: string; title: string; url: string };
+export type CalEvent = { id: string; date: string; time: string; title: string; url: string; start?: string; end?: string; allDay?: boolean };
 
 export async function setTrayMenu(lines: { id: string; label: string }[]): Promise<void> {
   try {
@@ -67,10 +67,7 @@ export async function backupNow(name: string): Promise<string> {
 }
 
 export async function saveTextFile(defaultName: string, contents: string): Promise<boolean> {
-  const path = await save({ defaultPath: defaultName });
-  if (!path) return false;
-  await invoke("write_text_file", { path, contents });
-  return true;
+  return invoke<boolean>("save_text_file", { defaultName, contents });
 }
 
 export async function pickAndStoreFile(): Promise<{ name: string; path: string } | null> {
@@ -89,6 +86,14 @@ export async function notifyDue(body: string): Promise<void> {
     sendNotification({ title: "To-Do Tracker", body });
   } catch {
     // A reminder is optional. The task stays on the list either way.
+  }
+}
+
+export async function onQuickCapture(run: () => void): Promise<UnlistenFn> {
+  try {
+    return await listen("quick-capture", () => run());
+  } catch {
+    return () => undefined;
   }
 }
 

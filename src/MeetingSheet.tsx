@@ -35,6 +35,7 @@ type Row = {
 };
 
 type Draft = {
+  saveId: string;
   personText: string;
   personId: string | null;
   title: string;
@@ -53,6 +54,7 @@ type Draft = {
   markDoneIds: string[];
   guestIds: string[];
   decisionText: string;
+  submittedSave?: { fingerprint: string; input: SaveMeetingInput };
 };
 
 type Props = {
@@ -69,6 +71,7 @@ type Props = {
   onSave: (input: SaveMeetingInput) => Promise<void>;
   onSaveTemplate: (name: string, lines: string[]) => void;
   onDeleteTemplate: (id: string) => void;
+  draftStorageKey?: string;
 };
 
 function explain(caught: unknown): string {
@@ -102,13 +105,14 @@ function blankRow(): Row {
   };
 }
 
-function readDraft(): Draft | null {
+function readDraft(storageKey = DRAFT_KEY): Draft | null {
   try {
-    const raw = localStorage.getItem(DRAFT_KEY);
+    const raw = localStorage.getItem(storageKey);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<Draft>;
     if (!parsed || !Array.isArray(parsed.rows)) return null;
     return {
+      saveId: typeof parsed.saveId === "string" && parsed.saveId ? parsed.saveId : crypto.randomUUID(),
       personText: parsed.personText ?? "",
       personId: parsed.personId ?? null,
       title: parsed.title ?? "",
@@ -142,16 +146,19 @@ function readDraft(): Draft | null {
       markDoneIds: Array.isArray(parsed.markDoneIds) ? parsed.markDoneIds : [],
       guestIds: Array.isArray(parsed.guestIds) ? parsed.guestIds : [],
       decisionText: parsed.decisionText ?? "",
+      ...(parsed.submittedSave && typeof parsed.submittedSave.fingerprint === "string" && parsed.submittedSave.input && typeof parsed.submittedSave.input === "object"
+        ? { submittedSave: parsed.submittedSave as Draft["submittedSave"] }
+        : {}),
     };
   } catch {
     return null;
   }
 }
 
-function writeDraft(draft: Draft | null) {
+function writeDraft(draft: Draft | null, storageKey = DRAFT_KEY) {
   try {
-    if (!draft) localStorage.removeItem(DRAFT_KEY);
-    else localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+    if (!draft) localStorage.removeItem(storageKey);
+    else localStorage.setItem(storageKey, JSON.stringify(draft));
   } catch {
     // A draft is only a convenience. Saving the meeting still works.
   }
@@ -163,6 +170,13 @@ function hasContent(draft: Draft, presetName: string): boolean {
     draft.title.trim() ||
       draft.noteLines.some((line) => line.text.trim()) ||
       draft.note.trim() ||
+      draft.topicLines.some((line) => line.text.trim()) ||
+      draft.questionLines.some((line) => line.text.trim()) ||
+      draft.privateNote.trim() ||
+      draft.nextOn.trim() ||
+      draft.nextFocus.trim() ||
+      draft.spanEnd.trim() ||
+      draft.sourceUrl.trim() ||
       typedPerson ||
       draft.markDoneIds.length > 0 ||
       draft.guestIds.length > 0 ||
@@ -171,19 +185,41 @@ function hasContent(draft: Draft, presetName: string): boolean {
   );
 }
 
+function draftFingerprint(draft: Draft): string {
+  const { saveId: _saveId, submittedSave: _submittedSave, ...authored } = draft;
+  const withoutLineKeys = (lines: Line[]) => lines
+    .filter((line) => line.text.trim())
+    .map(({ key: _key, ...line }) => line);
+  const rows = authored.rows
+    .filter((row) => row.title.trim())
+    .map(({ key: _key, ...row }) => row);
+  return JSON.stringify({
+    ...authored,
+    noteLines: withoutLineKeys(authored.noteLines),
+    topicLines: withoutLineKeys(authored.topicLines),
+    questionLines: withoutLineKeys(authored.questionLines),
+    rows,
+  });
+}
+
 function initialDraft(
   people: Person[],
   presetPersonId: string | null,
   presetDate: string | null,
   travelDates: string[],
   presetEvent: AgendaEvent | null,
+  draftStorageKey = DRAFT_KEY,
 ): { draft: Draft; restored: boolean } {
   const preset = people.find((person) => person.id === presetPersonId) ?? null;
-  const saved = readDraft();
+  const saved = readDraft(draftStorageKey);
   if (presetEvent) {
+    if (saved && hasContent(saved, preset?.name ?? "")) {
+      return { draft: { ...saved, rows: saved.rows.length > 0 ? saved.rows : [blankRow(), blankRow()] }, restored: true };
+    }
     return {
       restored: false,
       draft: {
+        saveId: crypto.randomUUID(),
         personText: preset?.name ?? "",
         personId: preset?.id ?? null,
         title: presetEvent.title,
@@ -214,6 +250,7 @@ function initialDraft(
   return {
     restored: false,
     draft: {
+      saveId: crypto.randomUUID(),
       personText: preset?.name ?? "",
       personId: preset?.id ?? null,
       title: "",
@@ -250,25 +287,32 @@ export function MeetingSheet({
   onSave,
   onSaveTemplate,
   onDeleteTemplate,
+  draftStorageKey = DRAFT_KEY,
 }: Props) {
   const today = todayISO();
-  const starting = initialDraft(data.people, presetPersonId, presetDate, travelDates, presetEvent);
+  const starting = initialDraft(data.people, presetPersonId, presetDate, travelDates, presetEvent, draftStorageKey);
   const [draft, setDraft] = useState<Draft>(starting.draft);
-  const [restored] = useState(starting.restored);
+  const [restored, setRestored] = useState(starting.restored);
+  const [recoveredFor, setRecoveredFor] = useState(
+    starting.restored ? { calendarUid: starting.draft.calendarUid, meetingDate: starting.draft.meetingDate } : null,
+  );
   const [showRest, setShowRest] = useState(starting.restored || Boolean(presetEvent));
   const [speechNote, setSpeechNote] = useState("");
   const [suggesting, setSuggesting] = useState(false);
   const [error, setError] = useState("");
+  const [recoveryKind, setRecoveryKind] = useState<"payload-mismatch" | "unverifiable-receipt" | null>(null);
   const [templateName, setTemplateName] = useState("");
   const savedRef = useRef(false);
+  const savingRef = useRef(false);
   const titleRefs = useRef<Array<HTMLInputElement | null>>([]);
   const presetName = data.people.find((person) => person.id === presetPersonId)?.name ?? "";
 
   useEffect(() => {
     if (savedRef.current) return;
-    writeDraft(hasContent(draft, presetName) ? draft : null);
-    onDirty(hasContent(draft, presetName));
-  }, [draft, onDirty, presetName]);
+    const shouldKeepDraft = hasContent(draft, presetName) || Boolean(draft.calendarUid);
+    writeDraft(shouldKeepDraft ? draft : null, draftStorageKey);
+    onDirty(shouldKeepDraft);
+  }, [draft, draftStorageKey, onDirty, presetName]);
 
   useEffect(() => {
     if (!draft.personId) return;
@@ -288,11 +332,11 @@ export function MeetingSheet({
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape" && !busy && !savingRef.current) onClose();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, busy]);
 
   const resolved =
     findPersonByName(data.people, draft.personText) ??
@@ -331,6 +375,7 @@ export function MeetingSheet({
 
   async function save(event?: { preventDefault: () => void }) {
     event?.preventDefault();
+    if (busy || savingRef.current) return;
     const match = findPersonByName(data.people, draft.personText);
     const id = match?.id ?? null;
     const newName = id ? null : draft.personText.trim();
@@ -381,32 +426,48 @@ export function MeetingSheet({
       .map((line) => `${"  ".repeat(line.indent)}${line.text.trim()}`)
       .filter((line) => line.trim())
       .join("\n");
+    const fingerprint = draftFingerprint(draft);
+    const cachedInput = draft.submittedSave?.fingerprint === fingerprint ? draft.submittedSave.input : null;
+    const input: SaveMeetingInput = cachedInput
+      ? { ...cachedInput, saveId: draft.saveId }
+      : {
+          personId: id,
+          newPersonName: newName,
+          title: draft.title,
+          meetingDate: draft.meetingDate,
+          note,
+          noteLines: draft.noteLines,
+          topics: draft.topicLines,
+          questions: draft.questionLines,
+          privateNote: draft.privateNote,
+          nextOn: draft.nextOn || null,
+          nextFocus: draft.nextFocus,
+          spanEnd: draft.spanEnd || null,
+          sourceUrl: draft.sourceUrl,
+          calendarUid: draft.calendarUid,
+          saveId: draft.saveId,
+          tasks,
+          markDoneIds: draft.markDoneIds.filter((taskId) => openTasks.some((task) => task.id === taskId)),
+          guestIds: draft.guestIds,
+          decisions,
+          decisionWhys,
+        };
+    const submittedDraft = { ...draft, submittedSave: { fingerprint, input } };
+    setDraft(submittedDraft);
+    writeDraft(submittedDraft, draftStorageKey);
     setError("");
+    setRecoveryKind(null);
+    savingRef.current = true;
     try {
-      await onSave({
-        personId: id,
-        newPersonName: newName,
-        title: draft.title,
-        meetingDate: draft.meetingDate,
-        note,
-        noteLines: draft.noteLines,
-        topics: draft.topicLines,
-        questions: draft.questionLines,
-        privateNote: draft.privateNote,
-        nextOn: draft.nextOn || null,
-        nextFocus: draft.nextFocus,
-        spanEnd: draft.spanEnd || null,
-        sourceUrl: draft.sourceUrl,
-        calendarUid: draft.calendarUid,
-        tasks,
-        markDoneIds: draft.markDoneIds.filter((taskId) => openTasks.some((task) => task.id === taskId)),
-        guestIds: draft.guestIds,
-        decisions,
-        decisionWhys,
-      });
+      await onSave(input);
+      setRecoveryKind(null);
+      setRestored(false);
+      setRecoveredFor(null);
       if (stayOpen) {
         const cleared = {
           ...draft,
+          saveId: crypto.randomUUID(),
+          submittedSave: undefined,
           title: "",
           note: "",
           noteLines: [{ key: crypto.randomUUID(), text: "", indent: 0 }],
@@ -418,19 +479,34 @@ export function MeetingSheet({
           markDoneIds: [],
         };
         setDraft(cleared);
-        writeDraft(null);
+        writeDraft(null, draftStorageKey);
       } else {
         savedRef.current = true;
-        writeDraft(null);
+        writeDraft(null, draftStorageKey);
       }
     } catch (caught) {
       setError(explain(caught));
+      if (caught && typeof caught === "object" && "recoveryKind" in caught) {
+        const kind = (caught as { recoveryKind?: unknown }).recoveryKind;
+        setRecoveryKind(kind === "payload-mismatch" || kind === "unverifiable-receipt" ? kind : null);
+      } else {
+        setRecoveryKind(null);
+      }
+    } finally {
+      savingRef.current = false;
     }
   }
 
+  function prepareNewSaveAttempt() {
+    setDraft((current) => ({ ...current, saveId: crypto.randomUUID() }));
+    setRecoveryKind(null);
+    setError("A new save attempt is ready. Select Save meeting to retry.");
+  }
+
   function discard() {
+    if (busy || savingRef.current) return;
     savedRef.current = true;
-    writeDraft(null);
+    writeDraft(null, draftStorageKey);
     onClose();
   }
 
@@ -450,9 +526,11 @@ export function MeetingSheet({
   }
 
   return (
-    <div className="overlay" onMouseDown={onClose}>
+    <div className="overlay" onMouseDown={() => { if (!busy && !savingRef.current) onClose(); }}>
       <form
         className="sheet"
+        inert={busy}
+        aria-busy={busy}
         onMouseDown={(event) => event.stopPropagation()}
         onSubmit={(event) => void save(event)}
         onKeyDown={(event) => {
@@ -488,6 +566,11 @@ export function MeetingSheet({
                   type="button"
                   className={draft.calendarUid === event.id && draft.meetingDate === event.date ? "chip selected" : "chip"}
                   onClick={() => {
+                    if (recoveredFor && (event.id !== recoveredFor.calendarUid || event.date !== recoveredFor.meetingDate)) {
+                      setError("Finish saving or discard the recovered meeting draft before choosing another calendar event.");
+                      return;
+                    }
+                    setError("");
                     const person = personInTitle(data.people, event.title);
                     patch({
                       title: event.title,
@@ -507,6 +590,9 @@ export function MeetingSheet({
           </div>
         )}
         {restored && <p className="hint">Picking up where you left off.</p>}
+        {recoveredFor && presetEvent && (recoveredFor.calendarUid !== presetEvent.id || recoveredFor.meetingDate !== presetEvent.date) && (
+          <p className="hint">A saved draft is open. This calendar event stays unselected until you save or discard that draft.</p>
+        )}
         {!showRest && (
           <p className="hint">
             Start with the note. The person, the date, and the tasks appear when you leave it.{" "}
@@ -933,6 +1019,11 @@ export function MeetingSheet({
           </button>
         </div>
         {error && <p className="form-error">{error}</p>}
+        {recoveryKind && (
+          <button type="button" className="text-button" onClick={prepareNewSaveAttempt}>
+            Prepare new save attempt
+          </button>
+        )}
         <div className="sheet-actions">
           <button type="button" className="text-button" onClick={discard}>
             Discard
